@@ -12,8 +12,10 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.ops.triton_attention_helpers import (
     compute_tile_loop_bounds,
 )
+from vllm.v1.attention.ops.triton_ngc_scorer import ngc_page_scores
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import KVQuantMode
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -34,6 +36,99 @@ NUM_BLOCKS = [32768, 2048]
 # 0: use 2D kernel for decode
 # 8: use 3D kernel for decode
 SEQ_THRESHOLD_3D_VALUES = [0, 8]
+
+
+@pytest.mark.parametrize("layout", list(KVCacheLayout))
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("position_case", ["all_past", "mixed", "no_past"])
+@pytest.mark.parametrize(
+    "num_q,kept_len,head_dim,group_size,scoring_pages,query_scale",
+    [
+        (1, 16, 64, 1, 1, 1.0),
+        (5, 273, 80, 3, 1, 1.0),
+        (17, 257, 64, 3, 2, 20.0),
+        (0, 17, 64, 1, 1, 1.0),
+        (5, 0, 64, 1, 1, 1.0),
+    ],
+)
+def test_ngc_page_scores_match_retained_key_softmax(
+    layout,
+    dtype,
+    position_case,
+    num_q,
+    kept_len,
+    head_dim,
+    group_size,
+    scoring_pages,
+    query_scale,
+):
+    """Score only earlier original positions, including fully masked prefixes."""
+    set_random_seed(0)
+    page_size, num_kv_heads, num_pages = 16, 2, 32
+    num_heads = num_kv_heads * group_size
+    shape = (2, num_pages, num_kv_heads, page_size, 2 * head_dim)
+    order = layout.stride_order
+    storage = torch.randn(
+        tuple(shape[i] for i in order), device=DEVICE_TYPE, dtype=dtype
+    )
+    cache = storage.permute(*(order.index(i) for i in range(5)))[1]
+    keys = cache[..., :head_dim]
+    # Match a layer slice from the original cross-layer recent-query buffer.
+    queries = torch.randn(
+        num_q, 2, num_heads, head_dim, device=DEVICE_TYPE, dtype=dtype
+    )[:, 1]
+    queries.mul_(query_scale)
+    needed_pages = (kept_len + page_size - 1) // page_size
+    table = (torch.randperm(num_pages - 1, device=DEVICE_TYPE) + 1).to(torch.int32)
+    table[needed_pages:] = -1  # Unused entries must never be dereferenced.
+    scoring_size = scoring_pages * page_size
+    scale = head_dim**-0.5
+    # Gaps model eviction; reversed order exercises fully masked initial tiles.
+    key_positions = torch.arange(kept_len, device=DEVICE_TYPE).flip(0) * 2
+    query_positions = torch.arange(num_q, device=DEVICE_TYPE)
+    if position_case == "all_past":
+        query_positions += 2 * kept_len
+    elif position_case == "mixed":
+        query_positions *= max(1, 2 * kept_len // max(1, num_q))
+    else:
+        query_positions.zero_()
+    # Exercise positions beyond int32 without narrowing them in the kernel.
+    key_positions += 2**33
+    query_positions += 2**33
+    allowed = key_positions[None, :] < query_positions[:, None]
+    scores = ngc_page_scores(
+        queries,
+        keys,
+        table,
+        kept_len,
+        scale,
+        scoring_size,
+        query_positions=query_positions,
+        key_positions=key_positions,
+    )
+    expected = torch.zeros_like(scores)
+    if num_q and kept_len:
+        retained = keys[table[:needed_pages].long()].transpose(1, 2)
+        retained = retained.reshape(-1, num_kv_heads, head_dim)[:kept_len]
+        retained = retained.repeat_interleave(group_size, dim=1)
+        logits = torch.einsum("qhd,khd->qhk", queries.float(), retained.float())
+        logits = (logits * scale).masked_fill(~allowed[:, None, :], -float("inf"))
+        # Define empty attention rows as zero rather than softmax(-inf) NaNs.
+        has_keys = allowed.any(dim=-1)[:, None, None]
+        probs = logits.masked_fill(~has_keys, 0).softmax(dim=-1)
+        token_mass = probs.masked_fill(~allowed[:, None, :], 0).sum(dim=(0, 1))
+        for block in range(expected.numel()):
+            expected[block] = token_mass[
+                block * scoring_size : (block + 1) * scoring_size
+            ].sum()
+    torch.testing.assert_close(scores, expected, atol=2e-3, rtol=2e-3)
+    if kept_len:
+        torch.testing.assert_close(
+            scores.sum(),
+            allowed.any(dim=-1).sum().float() * num_heads,
+            atol=2e-3,
+            rtol=2e-3,
+        )
 
 
 @triton.jit

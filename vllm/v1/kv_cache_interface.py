@@ -136,6 +136,7 @@ def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
 
 class KVCacheSpecKind(str, Enum):
     FULL_ATTENTION = "full_attention"
+    NGC_EVICTION = "ngc_eviction"
     MLA_ATTENTION = "mla_attention"
     SLIDING_WINDOW = "sliding_window"
     SLIDING_WINDOW_MLA = "sliding_window_mla"
@@ -537,6 +538,26 @@ class FullAttentionSpec(AttentionSpec):
             "layers is not supported."
         )
         return merged_spec
+
+
+@dataclass(frozen=True, kw_only=True)
+class NGCEvictionSpec(AttentionSpec):
+    """Standard K/V storage for layers designated for NGC eviction.
+
+    This spec marks the eviction policy boundary; it does not evict blocks.
+    Allocation remains full-context until an eviction budget is implemented.
+    """
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        max_model_len = vllm_config.model_config.max_model_len
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        if dcp_world_size > 1:
+            max_model_len = cdiv(max_model_len, dcp_world_size)
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
 
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
@@ -1134,6 +1155,8 @@ def get_kv_cache_spec_kind(kv_cache_spec: KVCacheSpec) -> KVCacheSpecKind:
         return KVCacheSpecKind.UNKNOWN
     # Keep subclass checks before base classes so specialized specs keep their
     # more precise kind.
+    if isinstance(kv_cache_spec, NGCEvictionSpec):
+        return KVCacheSpecKind.NGC_EVICTION
     if isinstance(kv_cache_spec, SlidingWindowMLASpec):
         return KVCacheSpecKind.SLIDING_WINDOW_MLA
     if isinstance(kv_cache_spec, MLAAttentionSpec):

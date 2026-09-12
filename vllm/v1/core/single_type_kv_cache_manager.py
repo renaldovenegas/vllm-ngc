@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    NGCEvictionSpec,
     RSWASpec,
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
@@ -2064,6 +2065,12 @@ def get_manager_for_kv_cache_spec(
 
 def register_all_kvcache_specs(vllm_config):
     """Built-in spec registration"""
+    # Use full-context allocation until NGC eviction is implemented.
+    KVCacheSpecRegistry.register(
+        NGCEvictionSpec,
+        FullAttentionManager,
+        uniform_type_base_spec=NGCEvictionSpec,
+    )
     KVCacheSpecRegistry.register(
         FullAttentionSpec,
         FullAttentionManager,

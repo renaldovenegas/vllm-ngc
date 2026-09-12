@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpecKind,
     MambaSpec,
     MLAAttentionSpec,
+    NGCEvictionSpec,
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
@@ -83,6 +84,7 @@ class _TrulyUnregisteredSpec(KVCacheSpec):
 
 
 spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
+    NGCEvictionSpec: FullAttentionManager,
     FullAttentionSpec: FullAttentionManager,
     MLAAttentionSpec: FullAttentionManager,
     HiddenStateCacheSpec: FullAttentionManager,
@@ -95,6 +97,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
 }
 
 spec_uniform_base_map: dict[type[KVCacheSpec], type[KVCacheSpec]] = {
+    NGCEvictionSpec: NGCEvictionSpec,
     FullAttentionSpec: FullAttentionSpec,
     MLAAttentionSpec: FullAttentionSpec,
     HiddenStateCacheSpec: FullAttentionSpec,
@@ -107,6 +110,9 @@ spec_uniform_base_map: dict[type[KVCacheSpec], type[KVCacheSpec]] = {
 }
 
 spec_args_map: dict[type[KVCacheSpec], dict[str, Any]] = {
+    NGCEvictionSpec: dict(
+        block_size=64, num_kv_heads=8, head_size=128, dtype=torch.bfloat16
+    ),
     FullAttentionSpec: dict(
         block_size=64, num_kv_heads=8, head_size=128, dtype=torch.bfloat16
     ),
@@ -319,6 +325,7 @@ class TestGetKVCacheSpecKind:
     @pytest.mark.parametrize(
         "spec_cls,expected_kind",
         [
+            (NGCEvictionSpec, KVCacheSpecKind.NGC_EVICTION),
             (FullAttentionSpec, KVCacheSpecKind.FULL_ATTENTION),
             (MLAAttentionSpec, KVCacheSpecKind.MLA_ATTENTION),
             (SlidingWindowSpec, KVCacheSpecKind.SLIDING_WINDOW),
@@ -332,6 +339,17 @@ class TestGetKVCacheSpecKind:
         )
 
         assert get_kv_cache_spec_kind(group) == expected_kind
+
+    def test_ngc_eviction_keeps_separate_groups_and_disables_prefix_reuse(self):
+        ngc = make_spec(NGCEvictionSpec)
+        full = make_spec(FullAttentionSpec)
+        assert not are_uniform_specs(ngc, full)
+        assert not are_uniform_specs(full, ngc)
+        assert are_uniform_specs(ngc, replace(ngc))
+        merged = NGCEvictionSpec.merge([ngc, replace(ngc)])
+        assert get_kv_cache_spec_kind(merged) == KVCacheSpecKind.NGC_EVICTION
+        assert not merged.prefix_cacheable
+        assert merged.page_size_bytes == full.page_size_bytes
 
     @pytest.mark.parametrize("other_cls", [MLAAttentionSpec, SinkFullAttentionSpec])
     def test_mixed_kinds_sharing_full_attention_base(self, other_cls):
