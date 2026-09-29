@@ -18,6 +18,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     FullAttentionManager,
     MambaManager,
+    NGCEvictionManager,
     SingleTypeKVCacheManager,
     SinkFullAttentionManager,
     SlidingWindowManager,
@@ -85,7 +86,7 @@ class _TrulyUnregisteredSpec(KVCacheSpec):
 
 
 spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
-    NGCEvictionSpec: FullAttentionManager,
+    NGCEvictionSpec: NGCEvictionManager,
     FullAttentionSpec: FullAttentionManager,
     MLAAttentionSpec: FullAttentionManager,
     HiddenStateCacheSpec: FullAttentionManager,

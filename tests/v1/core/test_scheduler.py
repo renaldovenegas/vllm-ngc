@@ -37,7 +37,9 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    NGCEvictionSpec,
 )
+from vllm.v1.ngc_eviction import NGCEvictionProposal
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
@@ -51,6 +53,85 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_ngc_scheduler_applies_completed_proposal_before_next_allocation(
+    tmp_path, monkeypatch
+):
+    from vllm.platforms import current_platform
+
+    if not current_platform.device_type:
+        monkeypatch.setattr(current_platform, "device_type", "cpu")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        kv_cache_spec=NGCEvictionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.float16,
+            cadence=1,
+            eviction_rate=0.5,
+        ),
+        num_blocks=16,
+        skip_tokenizer_init=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=64, max_tokens=8)
+    rid = request.request_id
+    scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    scheduler.update_from_output(
+        prefill,
+        ModelRunnerOutput(
+            req_ids=[rid],
+            req_id_to_index={rid: 0},
+            sampled_token_ids=[[10]],
+        ),
+    )
+    decode = scheduler.schedule()
+    original = decode.ngc_cache_updates[rid][0]
+    proposal = NGCEvictionProposal(
+        request_id=rid,
+        layer_name="layer",
+        group_id=0,
+        table_version=decode.ngc_table_versions[rid],
+        cadence_boundary=1,
+        computed_generated_tokens=1,
+        retained_tokens=65,
+        page_size=16,
+        block_ids=original.block_ids,
+        scores=(0.9, 0.1, 0.2, 0.8, 0.0),
+        victim_indices=(1, 2),
+        victim_block_ids=(original.block_ids[1], original.block_ids[2]),
+    )
+    free_before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    scheduler.update_from_output(
+        decode,
+        ModelRunnerOutput(
+            req_ids=[rid],
+            req_id_to_index={rid: 0},
+            sampled_token_ids=[[11]],
+            ngc_eviction_proposals=[proposal],
+        ),
+    )
+    assert scheduler.ngc_eviction_inbox.pending == {(rid, 0): proposal}
+    next_step = scheduler.schedule()
+    update = next_step.ngc_cache_updates[rid][0]
+    assert update.evicted_tokens == 32
+    assert update.page_positions == (0, 48, 64)
+    assert update.block_ids == (
+        original.block_ids[0],
+        original.block_ids[3],
+        original.block_ids[4],
+    )
+    assert (
+        scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free_before + 2
+    )
+    assert request.num_computed_tokens == 66
+    assert next_step.scheduled_cached_reqs.num_computed_tokens == [65]
+    assert not scheduler.ngc_eviction_inbox.pending
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():

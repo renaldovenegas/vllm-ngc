@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.v1.ngc_eviction import NGCEvictionInbox, NGCEvictionProposal
+from vllm.v1.ngc_eviction import NGCCacheLayout, NGCEvictionInbox, NGCEvictionProposal
 from vllm.v1.worker.ngc_scoring import NGCScoringBuffers, select_ngc_victims
 
 
@@ -161,6 +161,19 @@ def test_scoring_cadence_reduction_and_preemption_replay():
     assert buffers.due_boundary("a", "layer.0", 2, 2) == 2
 
 
+def test_repeated_eviction_preserves_original_positions_and_layer_independence():
+    first, second = NGCCacheLayout(), NGCCacheLayout()
+    for layout in (first, second):
+        layout.extend(6, 4)
+    first.evict((0, 2), 4)
+    first.extend(1, 4)
+    first.evict((1,), 4)
+    assert first.page_positions == [4, 16, 20, 24]
+    assert first.evicted_tokens == 12
+    assert second.page_positions == [0, 4, 8, 12, 16, 20]
+    assert second.evicted_tokens == 0
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf")])
 def test_nonfinite_page_scores_are_not_ranked(value):
     with pytest.raises(ValueError, match="finite"):
@@ -182,7 +195,8 @@ def test_nonfinite_page_scores_are_not_ranked(value):
         "victim",
     ],
 )
-def test_handoff_accepts_only_completed_current_cache_snapshots(change):
+@pytest.mark.parametrize("evicted_tokens", [0, 16])
+def test_handoff_accepts_only_completed_current_cache_snapshots(change, evicted_tokens):
     inbox = NGCEvictionInbox()
     version = inbox.schedule("a")
     proposal = NGCEvictionProposal(
@@ -204,9 +218,10 @@ def test_handoff_accepts_only_completed_current_cache_snapshots(change):
         layer_name="layer.0",
         block_ids=[8, 3, 7],
         page_size=16,
-        computed_tokens=48,
-        prompt_tokens=46,
+        computed_tokens=48 + evicted_tokens,
+        prompt_tokens=46 + evicted_tokens,
         in_flight_tokens=0,
+        evicted_tokens=evicted_tokens,
     )
     if change == "rescheduled":
         inbox.schedule("a")
@@ -219,7 +234,7 @@ def test_handoff_accepts_only_completed_current_cache_snapshots(change):
     elif change == "in_flight":
         args["in_flight_tokens"] = 1
     elif change == "length":
-        args["computed_tokens"] = 49
+        args["computed_tokens"] = 49 + evicted_tokens
     elif change == "layer":
         proposal = replace(proposal, layer_name="layer.1")
     elif change == "version":

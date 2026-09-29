@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
+from vllm.v1.ngc_eviction import NGCCacheUpdate
 
 if TYPE_CHECKING:
     import numpy as np
@@ -297,6 +298,9 @@ class SchedulerOutput:
 
     # Unique snapshot versions, invalidated on rescheduling or freeing a request.
     ngc_table_versions: dict[str, int] = field(default_factory=dict)
+    ngc_cache_updates: dict[str, dict[int, NGCCacheUpdate]] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

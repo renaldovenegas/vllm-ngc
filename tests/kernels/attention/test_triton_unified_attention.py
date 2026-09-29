@@ -13,9 +13,13 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     compute_tile_loop_bounds,
 )
 from vllm.v1.attention.ops.triton_ngc_scorer import ngc_page_scores
+from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+    triton_reshape_and_cache_flash,
+)
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import KVQuantMode
 from vllm.v1.kv_cache_layout import KVCacheLayout
+from vllm.v1.worker.block_table import BlockTable
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -36,6 +40,107 @@ NUM_BLOCKS = [32768, 2048]
 # 0: use 2D kernel for decode
 # 8: use 3D kernel for decode
 SEQ_THRESHOLD_3D_VALUES = [0, 8]
+
+
+@pytest.mark.parametrize("page_size", [16, 32])
+@pytest.mark.parametrize("extend", [False, True])
+@pytest.mark.parametrize("victims", [(1,), (0, 2)])
+def test_ngc_compacted_slots_and_attention_match_original_position_mask(
+    page_size, extend, victims
+):
+    """Replace a table, append KV, and attend without reading evicted pages."""
+    set_random_seed(0)
+    device = torch.device(DEVICE_TYPE)
+    kernel_size, heads, dim = 16, 2, 64
+    prefix_len = 4 * page_size + 1
+    num_queries = page_size + 1 if extend else 1
+    seq_len = prefix_len + num_queries
+    physical_ids = [7, 2, 5, 1, 6, 0][: triton.cdiv(seq_len, page_size)]
+    kept_ids = [p for i, p in enumerate(physical_ids) if i not in victims]
+    evicted_tokens = len(victims) * page_size
+    retained_len = seq_len - evicted_tokens
+    dense_k = torch.randn(seq_len, heads, dim, device=device, dtype=torch.float16)
+    dense_v = torch.randn_like(dense_k)
+    query = torch.randn(num_queries, heads * 2, dim, device=device, dtype=torch.float16)
+    cache = torch.full(
+        (8 * page_size // kernel_size, heads, kernel_size, 2 * dim),
+        float("nan"),
+        device=device,
+        dtype=torch.float16,
+    )
+    key_cache = cache[..., :dim].transpose(1, 2)
+    value_cache = cache[..., dim:].transpose(1, 2)
+    original = torch.arange(prefix_len, device=device)
+    original_table = torch.tensor(physical_ids, device=device)
+    slots = original_table[original // page_size] * page_size + original % page_size
+    key_cache[slots // kernel_size, slots % kernel_size] = dense_k[:prefix_len]
+    value_cache[slots // kernel_size, slots % kernel_size] = dense_v[:prefix_len]
+    for victim in victims:
+        first = physical_ids[victim] * page_size // kernel_size
+        cache[first : first + page_size // kernel_size] = float("nan")
+
+    table = BlockTable(
+        block_size=page_size,
+        max_num_reqs=1,
+        max_num_blocks_per_req=6,
+        max_num_batched_tokens=num_queries,
+        pin_memory=False,
+        device=device,
+        kernel_block_size=kernel_size,
+        cp_kv_cache_interleave_size=1,
+    )
+    table.add_row(physical_ids, 0)
+    table.clear_row(0)
+    table.add_row(kept_ids, 0)
+    table.commit_block_table(1)
+    query_positions = torch.arange(prefix_len, seq_len, device=device)
+    cu_queries = torch.tensor([0, num_queries], device=device, dtype=torch.int32)
+    table.compute_slot_mapping(1, cu_queries, query_positions - evicted_tokens)
+    scale = torch.ones((), device=device)
+    triton_reshape_and_cache_flash(
+        dense_k[prefix_len:],
+        dense_v[prefix_len:],
+        key_cache,
+        value_cache,
+        table.slot_mapping.gpu[:num_queries],
+        "auto",
+        scale,
+        scale,
+    )
+    actual = torch.empty_like(query)
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=actual,
+        cu_seqlens_q=cu_queries,
+        max_seqlen_q=num_queries,
+        seqused_k=torch.tensor([retained_len], device=device, dtype=torch.int32),
+        max_seqlen_k=retained_len,
+        softmax_scale=dim**-0.5,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=table.get_device_tensor(1),
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    )
+    key_positions = torch.arange(seq_len, device=device)
+    allowed = key_positions[None, :] <= query_positions[:, None]
+    for victim in victims:
+        allowed[:, victim * page_size : (victim + 1) * page_size] = False
+    scores = (
+        torch.einsum(
+            "qhd,khd->hqk", query.float(), dense_k.repeat_interleave(2, dim=1).float()
+        )
+        * dim**-0.5
+    )
+    scores.masked_fill_(~allowed, float("-inf"))
+    expected = torch.einsum(
+        "hqk,khd->qhd", scores.softmax(-1), dense_v.repeat_interleave(2, dim=1).float()
+    )
+    torch.testing.assert_close(actual.float(), expected, atol=3e-3, rtol=3e-3)
 
 
 @pytest.mark.parametrize("layout", list(KVCacheLayout))

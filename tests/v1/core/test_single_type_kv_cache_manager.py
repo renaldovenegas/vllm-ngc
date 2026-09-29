@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+from dataclasses import replace
 
 import pytest
 import torch
@@ -17,6 +18,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     CircularBufferManager,
     FullAttentionManager,
     MambaManager,
+    NGCEvictionManager,
     RSWAManager,
     SlidingWindowManager,
 )
@@ -25,11 +27,67 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
     MambaSpec,
+    NGCEvictionSpec,
     RSWASpec,
     SlidingWindowSpec,
 )
+from vllm.v1.ngc_eviction import NGCEvictionProposal
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_ngc_eviction_reclaims_only_victims_and_allocates_after_retained_tail():
+    spec = NGCEvictionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+        eviction_rate=0.5,
+    )
+    pool = BlockPool(num_gpu_blocks=16, enable_caching=False, hash_block_size=4)
+    manager = NGCEvictionManager(
+        spec,
+        pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+    )
+    blocks = manager.allocate_new_blocks("a", 17, 17)
+    other = manager.allocate_new_blocks("b", 8, 8)
+    free_before = pool.get_num_free_blocks()
+    proposal = NGCEvictionProposal(
+        request_id="a",
+        layer_name="layer.0",
+        group_id=0,
+        table_version=1,
+        cadence_boundary=2,
+        computed_generated_tokens=2,
+        retained_tokens=17,
+        page_size=4,
+        block_ids=tuple(b.block_id for b in blocks),
+        scores=(0.1, 0.9, 0.2, 0.8, 0.0),
+        victim_indices=(0, 2),
+        victim_block_ids=(blocks[0].block_id, blocks[2].block_id),
+    )
+    assert not manager.apply_eviction(replace(proposal, victim_block_ids=(-1, -2)), 17)
+    assert pool.get_num_free_blocks() == free_before
+    assert manager.apply_eviction(proposal, 17)
+    assert pool.get_num_free_blocks() == free_before + 2
+    assert blocks[0].ref_cnt == blocks[2].ref_cnt == 0
+    assert all(b.ref_cnt == 1 for b in [blocks[1], blocks[3], blocks[4], *other])
+    update = manager.get_cache_update("a")
+    assert update.page_positions == (4, 12, 16) and update.evicted_tokens == 8
+    assert not manager.apply_eviction(proposal, 17)
+    assert manager.get_num_blocks_to_allocate("a", 20, [], 17, 17, 20) == 0
+    assert not manager.allocate_new_blocks("a", 20, 20)
+    assert manager.get_num_blocks_to_allocate("a", 21, [], 20, 20, 21) == 1
+    assert len(manager.allocate_new_blocks("a", 21, 21)) == 1
+    assert manager.get_cache_update("a").page_positions == (4, 12, 16, 20)
+    manager.free("a")
+    manager.allocate_new_blocks("a", 5, 5)
+    replay = manager.get_cache_update("a")
+    assert replay.page_positions == (0, 4) and replay.evicted_tokens == 0
+    assert manager.get_cache_update("b").block_ids == tuple(b.block_id for b in other)
 
 
 def test_external_computed_blocks_do_not_corrupt_free_pool():

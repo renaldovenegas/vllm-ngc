@@ -66,6 +66,7 @@ from vllm.v1.kv_cache_interface import (
     iter_layer_specs,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
+from vllm.v1.ngc_eviction import NGCEvictionProposal
 from vllm.v1.request import Request
 
 pytestmark = pytest.mark.cpu_test
@@ -2416,7 +2417,11 @@ def test_multi_run_layer_compact_strides_place_hoisted_heads():
 @pytest.mark.parametrize("include_full", [False, True])
 def test_ngc_layers_get_independent_groups_with_identical_specs(include_full):
     spec = NGCEvictionSpec(
-        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.bfloat16
+        block_size=16,
+        num_kv_heads=2,
+        head_size=64,
+        dtype=torch.bfloat16,
+        eviction_rate=0.5,
     )
     specs = {"ngc.0": spec, "ngc.1": spec}
     if include_full:
@@ -2432,7 +2437,7 @@ def test_ngc_layers_get_independent_groups_with_identical_specs(include_full):
         kv_cache_config=KVCacheConfig(
             num_blocks=32, kv_cache_tensors=[], kv_cache_groups=groups
         ),
-        max_model_len=64,
+        max_model_len=128,
         scheduler_block_size=16,
         hash_block_size=16,
     )
@@ -2444,6 +2449,35 @@ def test_ngc_layers_get_independent_groups_with_identical_specs(include_full):
     block_ids = allocated.get_block_ids()
     assert all(len(ids) == 2 for ids in block_ids)
     assert len({block for ids in block_ids for block in ids}) == 2 * len(groups)
+
+    request.num_computed_tokens = 17
+    assert manager.allocate_slots(request, num_new_tokens=48) is not None
+    request.num_computed_tokens = 65
+    before = manager.get_block_ids(request.request_id)
+    gid = next(i for i, group in enumerate(groups) if group is ngc_groups[0])
+    proposal = NGCEvictionProposal(
+        request_id=request.request_id,
+        layer_name="ngc.0",
+        group_id=gid,
+        table_version=1,
+        cadence_boundary=64,
+        computed_generated_tokens=65,
+        retained_tokens=65,
+        page_size=16,
+        block_ids=tuple(before[gid]),
+        scores=(0.1, 0.2, 0.9, 0.8, 0.0),
+        victim_indices=(0, 1),
+        victim_block_ids=tuple(before[gid][:2]),
+    )
+    assert manager.apply_ngc_eviction(request, proposal)
+    after = manager.get_block_ids(request.request_id)
+    for group_id, original_ids in enumerate(before):
+        assert after[group_id] == (
+            original_ids[2:] if group_id == gid else original_ids
+        )
+    updates = manager.get_ngc_cache_updates(request.request_id)
+    assert updates[gid].evicted_tokens == 32
+    assert all(u.evicted_tokens == 0 for i, u in updates.items() if i != gid)
 
 
 def test_mla_draft_prefers_standard_layout_when_pages_can_be_unified():

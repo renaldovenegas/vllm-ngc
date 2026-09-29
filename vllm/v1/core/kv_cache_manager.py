@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
+from vllm.v1.core.single_type_kv_cache_manager import NGCEvictionManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -27,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     iter_layer_specs,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
+from vllm.v1.ngc_eviction import NGCCacheUpdate, NGCEvictionProposal
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
@@ -350,6 +352,22 @@ class KVCacheManager:
         blocks = self.create_kv_cache_blocks(computed)
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
+
+    def get_ngc_cache_updates(self, request_id: str) -> dict[int, NGCCacheUpdate]:
+        return {
+            group_id: manager.get_cache_update(request_id)
+            for group_id, manager in enumerate(self.coordinator.single_type_managers)
+            if isinstance(manager, NGCEvictionManager)
+        }
+
+    def apply_ngc_eviction(
+        self, request: Request, proposal: NGCEvictionProposal
+    ) -> bool:
+        if request.is_finished() or request.num_in_flight_tokens != 0:
+            return False
+        manager = self.coordinator.single_type_managers[proposal.group_id]
+        assert isinstance(manager, NGCEvictionManager)
+        return manager.apply_eviction(proposal, request.num_computed_tokens)
 
     def allocate_slots(
         self,

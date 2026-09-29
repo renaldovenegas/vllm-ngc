@@ -269,10 +269,11 @@ class Attention(nn.Module, AttentionLayerBase):
             attn_type != AttentionType.DECODER
             or sliding_window is not None
             or kv_sharing_target_layer_name is not None
+            or alibi_slopes is not None
         ):
             raise ValueError(
-                "NGC eviction requires decoder attention without sliding windows "
-                "or a shared KV cache target"
+                "NGC eviction requires decoder attention without sliding windows, "
+                "ALiBi, or a shared KV cache target"
             )
         self.ngc_eviction_config = ngc_eviction_config
         self.ngc_softmax_scale = scale

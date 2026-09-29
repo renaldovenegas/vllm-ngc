@@ -168,11 +168,13 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheSpecKind,
+    NGCEvictionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+from vllm.v1.ngc_eviction import NGCCacheUpdate
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -513,6 +515,8 @@ class GPUModelRunner(
         self.ngc_scoring_buffers = NGCScoringBuffers()
         self._ngc_capture_hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._ngc_scoring_layers: list[tuple[int, Attention]] = []
+        self._ngc_cache_updates: dict[str, dict[int, NGCCacheUpdate]] = {}
+        self._ngc_evicted_cpu: dict[int, torch.Tensor] = {}
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
@@ -1537,6 +1541,16 @@ class GPUModelRunner(
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
+        self._ngc_cache_updates = scheduler_output.ngc_cache_updates
+        for req_id, updates in self._ngc_cache_updates.items():
+            req_index = self.input_batch.req_id_to_index[req_id]
+            for group_id, update in updates.items():
+                block_ids = list(update.block_ids)
+                self.requests[req_id].block_ids[group_id][:] = block_ids
+                table = self.input_batch.block_table[group_id]
+                table.clear_row(req_index)
+                table.add_row(block_ids, req_index)
+
         # Incrementally update ngram_gpu tensors after batch is stable
         if is_ngram_gpu:
             update_ngram_gpu_tensors_incremental(
@@ -2218,11 +2232,26 @@ class GPUModelRunner(
         )
         self.seq_lens[num_reqs:].fill_(0)
 
-        self.input_batch.block_table.compute_slot_mapping(
-            num_reqs,
-            self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
-        )
+        self._ngc_evicted_cpu = {}
+        for group_id, table in enumerate(self.input_batch.block_table.block_tables):
+            cache_positions = self.positions[:total_num_scheduled_tokens]
+            if isinstance(
+                self.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec,
+                NGCEvictionSpec,
+            ):
+                evicted_cpu = torch.tensor(
+                    [
+                        self._ngc_cache_updates[req_id][group_id].evicted_tokens
+                        for req_id in self.input_batch.req_ids[:num_reqs]
+                    ],
+                    dtype=torch.int32,
+                )
+                self._ngc_evicted_cpu[group_id] = evicted_cpu
+                evicted = evicted_cpu.to(self.device)
+                cache_positions = cache_positions - evicted[req_indices_gpu]
+            table.compute_slot_mapping(
+                num_reqs, self.query_start_loc.gpu[: num_reqs + 1], cache_positions
+            )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2595,6 +2624,7 @@ class GPUModelRunner(
             elif (
                 cache_key in cached_attn_metadata
                 and builder.supports_update_block_table
+                and not isinstance(kv_cache_spec, NGCEvictionSpec)
             ):
                 attn_metadata_i = builder.update_block_table(
                     cached_attn_metadata[cache_key],
@@ -2637,6 +2667,21 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+
+            if (
+                isinstance(kv_cache_group.kv_cache_spec, NGCEvictionSpec)
+                and num_scheduled_tokens is not None
+                and not for_cudagraph_capture
+            ):
+                evicted = torch.zeros(num_reqs_padded, dtype=torch.int32)
+                evicted[:num_reqs] = self._ngc_evicted_cpu[kv_cache_gid]
+                retained = self.optimistic_seq_lens_cpu[:num_reqs_padded] - evicted
+                cm.seq_lens = retained.to(self.device)
+                cm._seq_lens_cpu = retained
+                cm.seq_lens_cpu_upper_bound = retained
+                cm._num_computed_tokens_cpu = None
+                cm._num_computed_tokens_cache = None
+                cm.max_seq_len = int(retained.max())
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
@@ -7582,12 +7627,7 @@ class GPUModelRunner(
         )
 
     def _score_ngc_pages(self, num_reqs: int) -> None:
-        """Build worker-local proposals after committed decode inputs have KV.
-
-        No eviction is applied yet, so original key positions are still the
-        dense range [0, seq_len). A future eviction manager must supply the
-        retained positions and lengths here when it starts compacting tables.
-        """
+        """Score retained keys using their original positions after KV writes."""
         for group_id, layer in self._ngc_scoring_layers:
             policy = layer.ngc_eviction_config
             assert policy is not None
@@ -7599,6 +7639,8 @@ class GPUModelRunner(
             for req_index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
                 seq_len = int(self.optimistic_seq_lens_cpu[req_index])
                 generated = max(seq_len - self.requests[req_id].num_prompt_tokens, 0)
+                update = self._ngc_cache_updates[req_id][group_id]
+                retained_len = seq_len - update.evicted_tokens
                 if (
                     self.ngc_scoring_buffers.due_boundary(
                         req_id, layer.layer_name, generated, policy.cadence
@@ -7611,13 +7653,23 @@ class GPUModelRunner(
                     raise ValueError(
                         "NGC scoring requires the logical paged K/V layout"
                     )
-                num_kernel_pages = cdiv(seq_len, kernel_size)
+                num_kernel_pages = cdiv(retained_len, kernel_size)
                 kernel_table = table.get_device_tensor(num_reqs)[
                     req_index, :num_kernel_pages
                 ]
                 ratio = block_size // kernel_size
                 # Kernel tables expand allocator page p into p*ratio + [0, ratio).
                 allocator_ids = kernel_table[::ratio] // ratio
+                compact_positions = torch.arange(
+                    retained_len, dtype=torch.int64, device=key_cache.device
+                )
+                page_positions = torch.tensor(
+                    update.page_positions, dtype=torch.int64, device=key_cache.device
+                )
+                key_positions = (
+                    page_positions[compact_positions // block_size]
+                    + compact_positions % block_size
+                )
                 self.ngc_scoring_buffers.score_if_due(
                     req_id,
                     layer.layer_name,
@@ -7629,9 +7681,7 @@ class GPUModelRunner(
                     key_cache=key_cache,
                     kernel_block_table=kernel_table,
                     block_ids=allocator_ids,
-                    key_positions=torch.arange(
-                        seq_len, dtype=torch.int64, device=key_cache.device
-                    ),
+                    key_positions=key_positions,
                     page_size=block_size,
                     softmax_scale=layer.ngc_softmax_scale,
                     reduce_scores=get_tp_group().all_reduce,
@@ -7658,6 +7708,10 @@ class GPUModelRunner(
                 )
             if self.is_pooling_model:
                 raise ValueError("NGC eviction handoff requires a generative model")
+            if self.use_async_scheduling or self.supports_mm_inputs:
+                raise ValueError(
+                    "NGC eviction requires synchronous scheduling and text-only inputs"
+                )
             if (
                 spec.dtype not in (torch.float16, torch.bfloat16)
                 or spec.kv_quant_mode != KVQuantMode.NONE
@@ -7694,6 +7748,13 @@ class GPUModelRunner(
                     "or ubatching"
                 )
             layer = layers[group.layer_names[0]]
+            if layer.get_attn_backend().get_name() != "TRITON_ATTN":
+                raise ValueError("NGC eviction currently requires TRITON_ATTN")
+            if (
+                self.model_config.rswa_window is not None
+                or layer.impl.chunk_lookback != -1
+            ):
+                raise ValueError("NGC eviction requires unrestricted causal attention")
             self._ngc_scoring_layers.append((group_id, layer))
             self._ngc_capture_hooks.append(
                 layer.register_forward_pre_hook(

@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+from vllm.v1.ngc_eviction import NGCCacheLayout, NGCCacheUpdate, NGCEvictionProposal
 from vllm.v1.request import Request
 
 
@@ -693,6 +694,106 @@ class SingleTypeKVCacheManager(ABC):
 
     def new_step_starts(self) -> None:
         return None
+
+
+class NGCEvictionManager(SingleTypeKVCacheManager):
+    """Private, compact page tables with original positions for NGC layers."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.enable_caching or self.dcp_world_size != 1 or self.pcp_world_size != 1:
+            raise ValueError("NGC requires private caches without context parallelism")
+        self.layouts: dict[str, NGCCacheLayout] = {}
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> int:
+        assert not new_computed_blocks
+        layout = self.layouts.get(request_id)
+        evicted = layout.evicted_tokens if layout else 0
+        return max(
+            cdiv(num_tokens - evicted, self.block_size)
+            - len(self.req_to_blocks.get(request_id, ())),
+            0,
+        )
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        layout = self.layouts.setdefault(request_id, NGCCacheLayout())
+        blocks = super().allocate_new_blocks(
+            request_id,
+            num_tokens - layout.evicted_tokens,
+            num_tokens_main_model - layout.evicted_tokens,
+        )
+        layout.extend(len(blocks), self.block_size)
+        return blocks
+
+    def get_cache_update(self, request_id: str) -> NGCCacheUpdate:
+        layout = self.layouts[request_id]
+        return NGCCacheUpdate(
+            tuple(b.block_id for b in self.req_to_blocks[request_id]),
+            tuple(layout.page_positions),
+            layout.evicted_tokens,
+        )
+
+    def apply_eviction(
+        self, proposal: NGCEvictionProposal, computed_tokens: int
+    ) -> bool:
+        request_id = proposal.request_id
+        layout = self.layouts.get(request_id)
+        blocks = self.req_to_blocks.get(request_id, [])
+        spec = self.kv_cache_spec
+        assert isinstance(spec, NGCEvictionSpec)
+        if layout is None:
+            return False
+        retained = computed_tokens - layout.evicted_tokens
+        num_pages = cdiv(retained, self.block_size)
+        victims = set(proposal.victim_indices)
+        if (
+            proposal.group_id != self.kv_cache_group_id
+            or proposal.page_size != self.block_size
+            or proposal.retained_tokens != retained
+            or len(blocks) != num_pages
+            or tuple(b.block_id for b in blocks) != proposal.block_ids
+            or len(victims) != len(proposal.victim_indices)
+            or any(i < 0 or i >= num_pages - 1 for i in victims)
+            or len(victims)
+            != min(
+                int(spec.eviction_rate * max(num_pages - 1, 0)),
+                max((retained - spec.min_retained_tokens) // self.block_size, 0),
+            )
+        ):
+            return False
+        removed = [blocks[i] for i in proposal.victim_indices]
+        if tuple(b.block_id for b in removed) != proposal.victim_block_ids or any(
+            b.is_null or b.ref_cnt != 1 for b in removed
+        ):
+            return False
+        self.req_to_blocks[request_id] = [
+            block for i, block in enumerate(blocks) if i not in victims
+        ]
+        layout.evict(proposal.victim_indices, self.block_size)
+        self.block_pool.free_blocks(removed)
+        return True
+
+    def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+        self.layouts.pop(request_id, None)
+        return super().pop_blocks_for_free(request_id)
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        return 0
+
+    @classmethod
+    def find_longest_cache_hit(cls, *args, **kwargs):
+        raise RuntimeError("NGC prefix caching is disabled")
 
 
 class FullAttentionManager(SingleTypeKVCacheManager):
@@ -2065,10 +2166,9 @@ def get_manager_for_kv_cache_spec(
 
 def register_all_kvcache_specs(vllm_config):
     """Built-in spec registration"""
-    # Use full-context allocation until NGC eviction is implemented.
     KVCacheSpecRegistry.register(
         NGCEvictionSpec,
-        FullAttentionManager,
+        NGCEvictionManager,
         uniform_type_base_spec=NGCEvictionSpec,
     )
     KVCacheSpecRegistry.register(

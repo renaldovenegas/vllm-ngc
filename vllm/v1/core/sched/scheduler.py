@@ -97,6 +97,20 @@ class Scheduler(SchedulerInterface):
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
             if isinstance(group.kv_cache_spec, NGCEvictionSpec)
         }
+        if self._ngc_groups and (
+            self.scheduler_config.async_scheduling
+            or vllm_config.kv_transfer_config is not None
+        ):
+            raise ValueError(
+                "NGC eviction requires async_scheduling=False and no KV transfer"
+            )
+        if self._ngc_groups and (
+            vllm_config.use_v2_model_runner
+            or vllm_config.model_config.enable_return_routed_experts
+        ):
+            raise ValueError(
+                "NGC eviction requires the V1 model runner without routed-expert output"
+            )
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
@@ -514,6 +528,12 @@ class Scheduler(SchedulerInterface):
         return max(num_new_tokens, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        pending = self.ngc_eviction_inbox.pending
+        for proposal in list(pending.values()):
+            request = self.requests.get(proposal.request_id)
+            if request is not None:
+                self.kv_cache_manager.apply_ngc_eviction(request, proposal)
+        pending.clear()
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1390,6 +1410,10 @@ class Scheduler(SchedulerInterface):
         scheduler_output.kv_connector_block_state = None
 
         if self._ngc_groups:
+            scheduler_output.ngc_cache_updates = {
+                req_id: self.kv_cache_manager.get_ngc_cache_updates(req_id)
+                for req_id in num_scheduled_tokens
+            }
             scheduler_output.ngc_table_versions = {
                 req_id: self.ngc_eviction_inbox.schedule(req_id)
                 for req_id in num_scheduled_tokens
@@ -1933,6 +1957,9 @@ class Scheduler(SchedulerInterface):
                         computed_tokens=request.num_computed_tokens,
                         prompt_tokens=request.num_prompt_tokens,
                         in_flight_tokens=request.num_in_flight_tokens,
+                        evicted_tokens=self.kv_cache_manager.get_ngc_cache_updates(
+                            req_id
+                        )[proposal.group_id].evicted_tokens,
                     )
 
             req_index = model_runner_output.req_id_to_index[req_id]

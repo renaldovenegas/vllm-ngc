@@ -545,13 +545,14 @@ class NGCEvictionSpec(AttentionSpec):
     """Standard K/V storage for layers designated for NGC eviction.
 
     This spec marks the eviction policy boundary; it does not evict blocks.
-    Allocation remains full-context until an eviction budget is implemented.
+    Runtime allocation follows retained pages. Startup capacity estimates still
+    reserve full-context capacity because prefill is not evicted.
     """
 
     cadence: int = 32
     """Committed generated tokens per request between eviction events."""
     eviction_rate: float = 0.1
-    """Fraction of eligible retained tokens to evict at each event."""
+    """Fraction of eligible retained pages to evict at each event."""
     min_retained_tokens: int = 1
     """Minimum retained history after eviction."""
 

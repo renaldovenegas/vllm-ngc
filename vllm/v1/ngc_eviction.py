@@ -2,8 +2,42 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU-only eviction proposals and scheduler completion tracking."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
+
+
+@dataclass(frozen=True)
+class NGCCacheUpdate:
+    """Replacement table and original page starts for one request and layer."""
+
+    block_ids: tuple[int, ...]
+    page_positions: tuple[int, ...]
+    evicted_tokens: int
+
+
+@dataclass
+class NGCCacheLayout:
+    """Original positions of retained pages, ordered by compact cache index.
+
+    New queries remain a suffix of these chronological keys, so ordinary causal
+    attention masks work with compact lengths while RoPE uses original positions.
+    """
+
+    page_positions: list[int] = field(default_factory=list)
+    evicted_tokens: int = 0
+
+    def extend(self, num_pages: int, page_size: int) -> None:
+        start = len(self.page_positions) * page_size + self.evicted_tokens
+        self.page_positions.extend(start + i * page_size for i in range(num_pages))
+
+    def evict(self, indices: tuple[int, ...], page_size: int) -> None:
+        victims = set(indices)
+        self.page_positions = [
+            position
+            for i, position in enumerate(self.page_positions)
+            if i not in victims
+        ]
+        self.evicted_tokens += len(victims) * page_size
 
 
 @dataclass(frozen=True)
@@ -60,10 +94,10 @@ class NGCEvictionInbox:
         computed_tokens: int,
         prompt_tokens: int,
         in_flight_tokens: int,
+        evicted_tokens: int = 0,
     ) -> bool:
         """Accept at output completion only if no later cache read is in flight."""
         p = proposal
-        # Before physical eviction exists, retained and computed lengths match.
         num_pages = (p.retained_tokens + page_size - 1) // page_size
         if (
             scheduled_version is None
@@ -72,7 +106,7 @@ class NGCEvictionInbox:
             or in_flight_tokens != 0
             or p.layer_name != layer_name
             or p.page_size != page_size
-            or p.retained_tokens != computed_tokens
+            or p.retained_tokens != computed_tokens - evicted_tokens
             or p.computed_generated_tokens != max(computed_tokens - prompt_tokens, 0)
             or not 0 < p.cadence_boundary <= p.computed_generated_tokens
             or len(p.block_ids) != num_pages
