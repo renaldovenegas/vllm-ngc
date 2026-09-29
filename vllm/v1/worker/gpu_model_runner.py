@@ -227,6 +227,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.ngc_scoring import NGCScoringBuffers
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -509,6 +510,9 @@ class GPUModelRunner(
         device: torch.device,
     ):
         self.vllm_config = vllm_config
+        self.ngc_scoring_buffers = NGCScoringBuffers()
+        self._ngc_capture_hooks: list[torch.utils.hooks.RemovableHandle] = []
+        self._ngc_scoring_layers: list[tuple[int, Attention]] = []
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
@@ -1212,6 +1216,7 @@ class GPUModelRunner(
         """
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
+            self.ngc_scoring_buffers.discard_request(req_id)
             req_state = self.requests.pop(req_id, None)
             self._on_request_state_removed(req_id, req_state)
             self.num_prompt_logprobs.pop(req_id, None)
@@ -1249,6 +1254,8 @@ class GPUModelRunner(
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
         resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        for req_id in resumed_req_ids | (scheduler_output.preempted_req_ids or set()):
+            self.ngc_scoring_buffers.discard_request(req_id, keep_cadence=True)
         # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
         # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
         # apart from the forced-preemption case in reset_prefix_cache. And in
@@ -4527,6 +4534,13 @@ class GPUModelRunner(
                 ubatch_slices_padded,
             )
         with (
+            self.ngc_scoring_buffers.batch(
+                self.input_batch.req_ids[:num_reqs],
+                num_scheduled_tokens_np[:num_reqs].tolist(),
+                positions,
+            )
+            if self._ngc_capture_hooks
+            else nullcontext(),
             set_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -4551,6 +4565,7 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            self._score_ngc_pages(num_reqs)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4875,6 +4890,10 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                ngc_eviction_proposals=self.ngc_scoring_buffers.take_proposals(
+                    scheduler_output.ngc_table_versions,
+                    [layer.layer_name for _, layer in self._ngc_scoring_layers],
+                ),
             )
 
         if not self.use_async_scheduling:
@@ -7505,6 +7524,7 @@ class GPUModelRunner(
         self._mamba_state_copy_funcs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        self._initialize_ngc_capture(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config,
@@ -7560,6 +7580,126 @@ class GPUModelRunner(
             routing_data=device_buffer[:num_tokens].clone(),
             slot_mapping=self.routed_experts_slot_mapping_device[:num_tokens].clone(),
         )
+
+    def _score_ngc_pages(self, num_reqs: int) -> None:
+        """Build worker-local proposals after committed decode inputs have KV.
+
+        No eviction is applied yet, so original key positions are still the
+        dense range [0, seq_len). A future eviction manager must supply the
+        retained positions and lengths here when it starts compacting tables.
+        """
+        for group_id, layer in self._ngc_scoring_layers:
+            policy = layer.ngc_eviction_config
+            assert policy is not None
+            table = self.input_batch.block_table[group_id]
+            block_size = self.kv_cache_config.kv_cache_groups[
+                group_id
+            ].kv_cache_spec.block_size
+            kernel_size = table.block_size
+            for req_index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                seq_len = int(self.optimistic_seq_lens_cpu[req_index])
+                generated = max(seq_len - self.requests[req_id].num_prompt_tokens, 0)
+                if (
+                    self.ngc_scoring_buffers.due_boundary(
+                        req_id, layer.layer_name, generated, policy.cadence
+                    )
+                    is None
+                ):
+                    continue
+                key_cache = layer.kv_cache[..., : layer.head_size]
+                if key_cache.ndim != 4 or key_cache.shape[2] != kernel_size:
+                    raise ValueError(
+                        "NGC scoring requires the logical paged K/V layout"
+                    )
+                num_kernel_pages = cdiv(seq_len, kernel_size)
+                kernel_table = table.get_device_tensor(num_reqs)[
+                    req_index, :num_kernel_pages
+                ]
+                ratio = block_size // kernel_size
+                # Kernel tables expand allocator page p into p*ratio + [0, ratio).
+                allocator_ids = kernel_table[::ratio] // ratio
+                self.ngc_scoring_buffers.score_if_due(
+                    req_id,
+                    layer.layer_name,
+                    group_id=group_id,
+                    computed_generated_tokens=generated,
+                    cadence=policy.cadence,
+                    eviction_rate=policy.eviction_rate,
+                    min_retained_tokens=policy.min_retained_tokens,
+                    key_cache=key_cache,
+                    kernel_block_table=kernel_table,
+                    block_ids=allocator_ids,
+                    key_positions=torch.arange(
+                        seq_len, dtype=torch.int64, device=key_cache.device
+                    ),
+                    page_size=block_size,
+                    softmax_scale=layer.ngc_softmax_scale,
+                    reduce_scores=get_tp_group().all_reduce,
+                )
+
+    def _initialize_ngc_capture(self, kv_cache_config: KVCacheConfig) -> None:
+        from vllm.v1.kv_cache_interface import KVQuantMode, NGCEvictionSpec
+
+        for hook in self._ngc_capture_hooks:
+            hook.remove()
+        self._ngc_capture_hooks = []
+        self._ngc_scoring_layers = []
+        self.ngc_scoring_buffers = NGCScoringBuffers()
+        layers = self.compilation_config.static_forward_context
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            if not isinstance(group.kv_cache_spec, NGCEvictionSpec):
+                continue
+            if not group.layer_names:
+                continue
+            spec = group.kv_cache_spec
+            if self.parallel_config.pipeline_parallel_size != 1:
+                raise ValueError(
+                    "NGC eviction handoff does not support pipeline parallelism"
+                )
+            if self.is_pooling_model:
+                raise ValueError("NGC eviction handoff requires a generative model")
+            if (
+                spec.dtype not in (torch.float16, torch.bfloat16)
+                or spec.kv_quant_mode != KVQuantMode.NONE
+                or spec.tokens_per_state != 1
+                or spec.num_heads != spec.num_kv_heads
+                or spec.state_content_bytes is not None
+            ):
+                raise ValueError(
+                    "NGC scoring requires unquantized FP16/BF16 K/V caches"
+                )
+            if spec.block_size & (spec.block_size - 1):
+                raise ValueError("NGC scoring requires power-of-two cache blocks")
+            if self.uses_mrope or self.uses_xdrope_dim:
+                raise ValueError("NGC scoring requires one-dimensional token positions")
+            if len(group.layer_names) != 1:
+                raise ValueError(
+                    "NGC layers require independent, unshared cache groups"
+                )
+            if (
+                not self.model_config.enforce_eager
+                or self.speculative_config is not None
+            ):
+                raise ValueError(
+                    "NGC query capture requires enforce_eager=True and no speculative "
+                    "decoding"
+                )
+            if (
+                self.parallel_config.use_ubatching
+                or self.parallel_config.decode_context_parallel_size != 1
+                or self.parallel_config.prefill_context_parallel_size != 1
+            ):
+                raise ValueError(
+                    "NGC query capture does not support context parallelism "
+                    "or ubatching"
+                )
+            layer = layers[group.layer_names[0]]
+            self._ngc_scoring_layers.append((group_id, layer))
+            self._ngc_capture_hooks.append(
+                layer.register_forward_pre_hook(
+                    self.ngc_scoring_buffers.capture, with_kwargs=True
+                )
+            )
 
     def init_routed_experts_capturer(self):
         logger.info(

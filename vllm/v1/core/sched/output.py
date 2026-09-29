@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -294,6 +294,9 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+
+    # Unique snapshot versions, invalidated on rescheduling or freeing a request.
+    ngc_table_versions: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

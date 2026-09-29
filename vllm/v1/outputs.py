@@ -13,6 +13,7 @@ import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.ngc_eviction import NGCEvictionProposal
 
 if TYPE_CHECKING:
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorWorkerMetadata
@@ -383,6 +384,8 @@ class ModelRunnerOutput:
 
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
+
+    ngc_eviction_proposals: list[NGCEvictionProposal] = field(default_factory=list)
 
     @staticmethod
     def with_kv_conn_output_only(

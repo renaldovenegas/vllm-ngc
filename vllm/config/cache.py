@@ -74,6 +74,24 @@ KVOffloadingBackend = Literal["native", "lmcache"]
 
 
 @config
+class NGCEvictionConfig:
+    """Per-layer NGC eviction policy; passing it to Attention opts the layer in."""
+
+    cadence: int = Field(default=32, gt=0, strict=True)
+    """Committed generated tokens per request between eviction events."""
+    query_buffer_size: int = Field(default=5, gt=0, strict=True)
+    """Number of recent query vectors retained per request and layer for scoring."""
+    min_retained_tokens: int = Field(default=1, gt=0, strict=True)
+    """Minimum retained history after eviction; the newest page is always protected."""
+    eviction_rate: float = Field(default=0.1, gt=0, lt=1)
+    """Fraction of eligible retained tokens to evict at each event.
+
+    Select floor(eviction_rate * eligible_pages) whole pages, subject to the
+    minimum retained history. The newest page is excluded from eligibility.
+    """
+
+
+@config
 class CacheConfig:
     """Configuration for the KV cache."""
 

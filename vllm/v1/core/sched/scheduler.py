@@ -54,13 +54,14 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, NGCEvictionSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
     PrefixCacheStats,
     RequestSpecDecodeMetrics,
     SchedulerStats,
 )
+from vllm.v1.ngc_eviction import NGCEvictionInbox
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
@@ -90,6 +91,12 @@ class Scheduler(SchedulerInterface):
         self.model_uses_mrope = vllm_config.model_config.uses_mrope
         self.model_uses_xdrope = vllm_config.model_config.uses_xdrope
         self.kv_cache_config = kv_cache_config
+        self.ngc_eviction_inbox = NGCEvictionInbox()
+        self._ngc_groups = {
+            group_id: group
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, NGCEvictionSpec)
+        }
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
@@ -1382,6 +1389,12 @@ class Scheduler(SchedulerInterface):
         # Connector-only block state must not be dispatched to workers.
         scheduler_output.kv_connector_block_state = None
 
+        if self._ngc_groups:
+            scheduler_output.ngc_table_versions = {
+                req_id: self.ngc_eviction_inbox.schedule(req_id)
+                for req_id in num_scheduled_tokens
+            }
+
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).
         if self.defer_block_free and total_num_scheduled_tokens > 0:
@@ -1871,6 +1884,9 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        ngc_proposals = defaultdict(list)
+        for proposal in model_runner_output.ngc_eviction_proposals:
+            ngc_proposals[proposal.request_id].append(proposal)
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1898,6 +1914,26 @@ class Scheduler(SchedulerInterface):
             # Drop-mode stale output (same-step resume) is discarded entirely.
             if output_is_stale and request.drop_stale_output:
                 continue
+
+            if not output_is_stale:
+                for proposal in ngc_proposals.get(req_id, ()):
+                    group = self._ngc_groups.get(proposal.group_id)
+                    if group is None or len(group.layer_names) != 1:
+                        continue
+                    self.ngc_eviction_inbox.receive(
+                        proposal,
+                        scheduled_version=scheduler_output.ngc_table_versions.get(
+                            req_id
+                        ),
+                        layer_name=group.layer_names[0],
+                        block_ids=self.kv_cache_manager.get_block_ids(req_id)[
+                            proposal.group_id
+                        ],
+                        page_size=group.kv_cache_spec.block_size,
+                        computed_tokens=request.num_computed_tokens,
+                        prompt_tokens=request.num_prompt_tokens,
+                        in_flight_tokens=request.num_in_flight_tokens,
+                    )
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
@@ -2490,6 +2526,8 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        self.ngc_eviction_inbox.invalidate(request.request_id)
+
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
@@ -2531,6 +2569,7 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        self.ngc_eviction_inbox.invalidate(request.request_id)
         if not self.defer_block_free or (
             # Last scheduled step already processed: no in-flight write remains
             # (always the case for a normal finish), so free now.
@@ -3092,6 +3131,9 @@ class Scheduler(SchedulerInterface):
 
         if not total_failed_requests:
             return set()
+
+        for req_id in async_failed_req_ids | sync_failed_req_ids:
+            self.ngc_eviction_inbox.invalidate(req_id)
 
         # evict invalid blocks and downstream dependent blocks from cache
         # only when not using recompute policy (where blocks will be recomputed

@@ -548,6 +548,33 @@ class NGCEvictionSpec(AttentionSpec):
     Allocation remains full-context until an eviction budget is implemented.
     """
 
+    cadence: int = 32
+    """Committed generated tokens per request between eviction events."""
+    eviction_rate: float = 0.1
+    """Fraction of eligible retained tokens to evict at each event."""
+    min_retained_tokens: int = 1
+    """Minimum retained history after eviction."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        if type(self.cadence) is not int or self.cadence <= 0:
+            raise ValueError("NGC cadence must be a positive integer")
+        if not 0 < self.eviction_rate < 1:
+            raise ValueError("NGC eviction_rate must be between 0 and 1, exclusive")
+        if type(self.min_retained_tokens) is not int or self.min_retained_tokens <= 0:
+            raise ValueError("NGC min_retained_tokens must be a positive integer")
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(
+            isinstance(spec, NGCEvictionSpec)
+            and spec.cadence == self.cadence
+            and spec.eviction_rate == self.eviction_rate
+            and spec.min_retained_tokens == self.min_retained_tokens
+            for spec in kv_cache_specs.values()
+        )
+
     @property
     def prefix_cacheable(self) -> bool:
         return False

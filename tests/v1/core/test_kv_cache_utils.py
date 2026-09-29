@@ -55,6 +55,7 @@ from vllm.v1.kv_cache_interface import (
     KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
+    NGCEvictionSpec,
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
@@ -2410,6 +2411,39 @@ def test_multi_run_layer_compact_strides_place_hoisted_heads():
             + head_group
         )
         assert end <= tensor.size
+
+
+@pytest.mark.parametrize("include_full", [False, True])
+def test_ngc_layers_get_independent_groups_with_identical_specs(include_full):
+    spec = NGCEvictionSpec(
+        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.bfloat16
+    )
+    specs = {"ngc.0": spec, "ngc.1": spec}
+    if include_full:
+        full = FullAttentionSpec(
+            block_size=16, num_kv_heads=2, head_size=64, dtype=torch.bfloat16
+        )
+        specs.update({"full.0": full, "full.1": full})
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+    ngc_groups = [g for g in groups if isinstance(g.kv_cache_spec, NGCEvictionSpec)]
+    assert [g.layer_names for g in ngc_groups] == [["ngc.0"], ["ngc.1"]]
+    assert len(groups) == 2 + int(include_full)
+    manager = KVCacheManager(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=32, kv_cache_tensors=[], kv_cache_groups=groups
+        ),
+        max_model_len=64,
+        scheduler_block_size=16,
+        hash_block_size=16,
+    )
+    request = make_request("ngc", [], block_size=16)
+    assert not manager.enable_caching
+    assert not manager.block_pool.enable_caching
+    allocated = manager.allocate_slots(request, num_new_tokens=17)
+    assert allocated is not None
+    block_ids = allocated.get_block_ids()
+    assert all(len(ids) == 2 for ids in block_ids)
+    assert len({block for ids in block_ids for block in ids}) == 2 * len(groups)
 
 
 def test_mla_draft_prefers_standard_layout_when_pages_can_be_unified():

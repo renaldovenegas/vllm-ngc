@@ -12,6 +12,7 @@ from vllm.config import (
     DeviceConfig,
     VllmConfig,
 )
+from vllm.config.cache import NGCEvictionConfig
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
     CrossAttentionManager,
@@ -321,6 +322,42 @@ class TestKVCacheSpecRegistry:
 
 class TestGetKVCacheSpecKind:
     """get_kv_cache_spec_kind() for merged UniformTypeKVCacheSpecs groups."""
+
+    @pytest.mark.parametrize(
+        "policy", [{"cadence": 8}, {"eviction_rate": 0.25}, {"min_retained_tokens": 64}]
+    )
+    def test_ngc_policies_cannot_share_a_uniform_group(self, policy):
+        spec = make_spec(NGCEvictionSpec)
+        different = replace(spec, **policy)
+        assert not are_uniform_specs(spec, different)
+        assert not are_uniform_specs(different, spec)
+        with pytest.raises(AssertionError):
+            NGCEvictionSpec.merge([spec, different])
+        assert NGCEvictionSpec.merge([different, different]) == different
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            {"cadence": 0},
+            {"cadence": -1},
+            {"cadence": 1.5},
+            {"cadence": True},
+            {"eviction_rate": 0},
+            {"eviction_rate": 1},
+            {"eviction_rate": -0.1},
+            {"eviction_rate": float("nan")},
+            {"eviction_rate": float("inf")},
+            {"min_retained_tokens": 0},
+            {"min_retained_tokens": -1},
+            {"min_retained_tokens": 1.5},
+            {"min_retained_tokens": True},
+        ],
+    )
+    def test_ngc_rejects_invalid_policy_in_config_and_spec(self, policy):
+        with pytest.raises(ValueError):
+            NGCEvictionConfig(**policy)
+        with pytest.raises(ValueError):
+            replace(make_spec(NGCEvictionSpec), **policy)
 
     @pytest.mark.parametrize(
         "spec_cls,expected_kind",

@@ -21,8 +21,10 @@ from vllm.v1.kv_cache_interface import (
     EncoderOnlyAttentionSpec,
     KVCacheConfig,
     MambaSpec,
+    NGCEvictionSpec,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
+    iter_layer_specs,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
@@ -140,7 +142,16 @@ class KVCacheManager:
         if max_in_flight_tokens is None:
             max_in_flight_tokens = max_model_len
 
-        self.enable_caching = enable_caching
+        has_ngc_layers = any(
+            isinstance(spec, NGCEvictionSpec)
+            for group in kv_cache_config.kv_cache_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        )
+        # A reusable full-attention prefix cannot reconstruct the missing NGC
+        # states. Recompute the prefix in every layer until replay is supported.
+        self.enable_caching = enable_caching and not has_ngc_layers
+        if enable_caching and has_ngc_layers:
+            logger.info("Disabling prefix caching for NGC eviction layers")
         self.enable_kv_cache_events = enable_kv_cache_events
         self.use_eagle = use_eagle
         self.log_stats = log_stats

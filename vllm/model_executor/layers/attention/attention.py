@@ -9,6 +9,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, get_current_vllm_config
+from vllm.config.cache import NGCEvictionConfig
 from vllm.config.vllm import VllmConfig
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -42,6 +43,7 @@ from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
+    NGCEvictionSpec,
     SlidingWindowSpec,
     get_kv_quant_mode,
 )
@@ -245,6 +247,7 @@ class Attention(nn.Module, AttentionLayerBase):
         mm_prefix_clamp_sliding_window: bool = False,
         attn_backend: type[AttentionBackend] | None = None,
         head_size_v: int | None = None,
+        ngc_eviction_config: NGCEvictionConfig | None = None,
         **extra_impl_args,
     ) -> None:
         """
@@ -261,6 +264,18 @@ class Attention(nn.Module, AttentionLayerBase):
             sliding_window = cache_config.sliding_window
         else:
             sliding_window = None
+
+        if ngc_eviction_config is not None and (
+            attn_type != AttentionType.DECODER
+            or sliding_window is not None
+            or kv_sharing_target_layer_name is not None
+        ):
+            raise ValueError(
+                "NGC eviction requires decoder attention without sliding windows "
+                "or a shared KV cache target"
+            )
+        self.ngc_eviction_config = ngc_eviction_config
+        self.ngc_softmax_scale = scale
 
         vllm_config = get_current_vllm_config()
         if cache_config is not None:
@@ -607,6 +622,18 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+        if self.ngc_eviction_config is not None:
+            return NGCEvictionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                kv_quant_mode=quant_mode,
+                cadence=self.ngc_eviction_config.cadence,
+                eviction_rate=self.ngc_eviction_config.eviction_rate,
+                min_retained_tokens=self.ngc_eviction_config.min_retained_tokens,
+            )
         if self.sliding_window is not None:
             assert not self.attn_backend.is_mla(), (
                 "MLA is not supported for sliding window"

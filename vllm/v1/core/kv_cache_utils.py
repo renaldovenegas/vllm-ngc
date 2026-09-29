@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    NGCEvictionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -1923,6 +1924,22 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
+    ngc_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, NGCEvictionSpec)
+    }
+    if ngc_specs:
+        remaining = {
+            name: spec for name, spec in kv_cache_spec.items() if name not in ngc_specs
+        }
+        groups = get_kv_cache_groups(vllm_config, remaining) if remaining else []
+        # Every layer needs its own allocation state even with identical policies.
+        groups.extend(
+            KVCacheGroupSpec([name], spec) for name, spec in ngc_specs.items()
+        )
+        return groups
+
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
