@@ -66,8 +66,8 @@ def select_ngc_victims(
     """
     if page_size <= 0 or retained_tokens < 0 or min_retained_tokens <= 0:
         raise ValueError("Invalid NGC page size or retained-token budget")
-    if not 0 < eviction_rate < 1:
-        raise ValueError("NGC eviction_rate must be between 0 and 1, exclusive")
+    if not 0 <= eviction_rate < 1:
+        raise ValueError("NGC eviction_rate must be in [0, 1)")
     num_pages = (retained_tokens + page_size - 1) // page_size
     if scores.ndim != 1 or scores.numel() != num_pages:
         raise ValueError("Expected one NGC score per allocator page")
@@ -100,7 +100,7 @@ class NGCScoringBuffers:
 
     def __init__(self):
         self.histories: dict[tuple[str, str], NGCQueryHistory] = {}
-        self._batch: list[tuple[str, int, int]] = []
+        self._batch: list[tuple[str, int, int, int]] = []
         self._positions: torch.Tensor | None = None
         self._scored_boundaries: dict[tuple[str, str], int] = {}
 
@@ -121,10 +121,16 @@ class NGCScoringBuffers:
 
     @contextmanager
     def batch(
-        self, req_ids: list[str], query_lengths: list[int], positions: torch.Tensor
+        self,
+        req_ids: list[str],
+        query_lengths: list[int],
+        positions: torch.Tensor,
+        *,
+        computed_generated_tokens: list[int],
     ):
-        if len(req_ids) != len(query_lengths):
-            raise ValueError("Request IDs and query lengths must have matching sizes")
+        """Prepare capture using post-forward CPU counts, negative during prefill."""
+        if not len(req_ids) == len(query_lengths) == len(computed_generated_tokens):
+            raise ValueError("Request IDs, query lengths, and counts must match")
         if self._positions is not None:
             raise RuntimeError("NGC capture batches cannot overlap")
         if positions.ndim != 1 or sum(query_lengths) > positions.numel():
@@ -132,8 +138,10 @@ class NGCScoringBuffers:
         if any(length < 0 for length in query_lengths):
             raise ValueError("Query lengths must be nonnegative")
         offset = 0
-        for req_id, length in zip(req_ids, query_lengths):
-            self._batch.append((req_id, offset, offset + length))
+        for req_id, length, generated in zip(
+            req_ids, query_lengths, computed_generated_tokens
+        ):
+            self._batch.append((req_id, offset, offset + length, generated))
             offset += length
         self._positions = positions
         try:
@@ -143,7 +151,7 @@ class NGCScoringBuffers:
             self._positions = None
 
     def capture(self, layer, args, kwargs):
-        """Attention forward pre-hook; warmup calls outside a batch are ignored."""
+        """Capture only the query window needed at the next scoring boundary."""
         if self._positions is None:
             return
         query = args[0] if args else kwargs["query"]
@@ -153,11 +161,33 @@ class NGCScoringBuffers:
                 "NGC capture query count does not cover the prepared batch"
             )
         capacity = layer.ngc_eviction_config.query_buffer_size
-        for req_id, start, end in self._batch:
+        cadence = layer.ngc_eviction_config.cadence
+        for req_id, start, end, generated in self._batch:
             if start == end:
                 continue
             key = (req_id, layer.layer_name)
             history = self.histories.get(key)
+            if history is not None:
+                history.page_scores = None
+                history.decision = None
+            # A chunk crossing a due boundary is scored at its final state.
+            due = self.due_boundary(
+                req_id, layer.layer_name, max(generated, 0), cadence
+            )
+            if due is not None:
+                incoming = min(end - start, capacity)
+            else:
+                next_boundary = max(
+                    cadence,
+                    ((generated + cadence - 1) // cadence) * cadence,
+                    self._scored_boundaries.get(key, 0) + cadence,
+                )
+                distance = next_boundary - generated
+                incoming = min(end - start, max(capacity - distance, 0))
+            if incoming == 0:
+                if history is not None:
+                    history.count = 0
+                continue
             if history is None:
                 history = NGCQueryHistory(
                     torch.empty(
@@ -168,9 +198,8 @@ class NGCScoringBuffers:
                     torch.empty(capacity, dtype=torch.int64, device=query.device),
                 )
                 self.histories[key] = history
-            incoming = min(end - start, capacity)
             old = min(history.count, capacity - incoming)
-            if old:
+            if old and old < history.count:
                 history.queries[:old].copy_(
                     history.queries[history.count - old : history.count].clone()
                 )
@@ -182,8 +211,6 @@ class NGCScoringBuffers:
                 self._positions[end - incoming : end]
             )
             history.count = old + incoming
-            history.page_scores = None
-            history.decision = None
 
     def get_queries(self, req_id: str, layer_name: str):
         """Return chronological views, valid until the next capture or removal."""

@@ -704,6 +704,8 @@ class NGCEvictionManager(SingleTypeKVCacheManager):
         if self.enable_caching or self.dcp_world_size != 1 or self.pcp_world_size != 1:
             raise ValueError("NGC requires private caches without context parallelism")
         self.layouts: dict[str, NGCCacheLayout] = {}
+        # Requests whose compacted layout the workers have not yet received.
+        self.changed_requests: set[str] = set()
 
     def get_num_blocks_to_allocate(
         self,
@@ -782,10 +784,12 @@ class NGCEvictionManager(SingleTypeKVCacheManager):
         ]
         layout.evict(proposal.victim_indices, self.block_size)
         self.block_pool.free_blocks(removed)
+        self.changed_requests.add(request_id)
         return True
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         self.layouts.pop(request_id, None)
+        self.changed_requests.discard(request_id)
         return super().pop_blocks_for_free(request_id)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:

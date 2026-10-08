@@ -353,12 +353,26 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
-    def get_ngc_cache_updates(self, request_id: str) -> dict[int, NGCCacheUpdate]:
-        return {
-            group_id: manager.get_cache_update(request_id)
-            for group_id, manager in enumerate(self.coordinator.single_type_managers)
-            if isinstance(manager, NGCEvictionManager)
-        }
+    def take_ngc_cache_updates(self, request_id: str) -> dict[int, NGCCacheUpdate]:
+        """Return layouts compacted since they were last taken.
+
+        Workers extend untouched layouts from ordinary block appends.
+        """
+        updates = {}
+        for group_id, manager in enumerate(self.coordinator.single_type_managers):
+            if (
+                isinstance(manager, NGCEvictionManager)
+                and request_id in manager.changed_requests
+            ):
+                manager.changed_requests.discard(request_id)
+                updates[group_id] = manager.get_cache_update(request_id)
+        return updates
+
+    def get_ngc_evicted_tokens(self, request_id: str, group_id: int) -> int:
+        manager = self.coordinator.single_type_managers[group_id]
+        assert isinstance(manager, NGCEvictionManager)
+        layout = manager.layouts.get(request_id)
+        return layout.evicted_tokens if layout else 0
 
     def apply_ngc_eviction(
         self, request: Request, proposal: NGCEvictionProposal

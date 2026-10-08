@@ -324,6 +324,12 @@ class TestKVCacheSpecRegistry:
 class TestGetKVCacheSpecKind:
     """get_kv_cache_spec_kind() for merged UniformTypeKVCacheSpecs groups."""
 
+    def test_ngc_zero_rate_keeps_ngc_spec(self):
+        assert NGCEvictionConfig(eviction_rate=0).eviction_rate == 0
+        spec = replace(make_spec(NGCEvictionSpec), eviction_rate=0)
+        assert isinstance(spec, NGCEvictionSpec)
+        assert spec.eviction_rate == 0
+
     @pytest.mark.parametrize(
         "policy", [{"cadence": 8}, {"eviction_rate": 0.25}, {"min_retained_tokens": 64}]
     )
@@ -343,7 +349,6 @@ class TestGetKVCacheSpecKind:
             {"cadence": -1},
             {"cadence": 1.5},
             {"cadence": True},
-            {"eviction_rate": 0},
             {"eviction_rate": 1},
             {"eviction_rate": -0.1},
             {"eviction_rate": float("nan")},

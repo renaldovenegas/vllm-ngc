@@ -560,8 +560,8 @@ class NGCEvictionSpec(AttentionSpec):
         super().__post_init__()
         if type(self.cadence) is not int or self.cadence <= 0:
             raise ValueError("NGC cadence must be a positive integer")
-        if not 0 < self.eviction_rate < 1:
-            raise ValueError("NGC eviction_rate must be between 0 and 1, exclusive")
+        if not 0 <= self.eviction_rate < 1:
+            raise ValueError("NGC eviction_rate must be in [0, 1)")
         if type(self.min_retained_tokens) is not int or self.min_retained_tokens <= 0:
             raise ValueError("NGC min_retained_tokens must be a positive integer")
 

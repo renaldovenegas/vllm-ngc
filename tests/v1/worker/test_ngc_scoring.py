@@ -17,9 +17,14 @@ def test_query_history_follows_requests_and_layers_across_batch_reordering():
         layer_name="layer.0",
         num_heads=1,
         head_size=1,
-        ngc_eviction_config=SimpleNamespace(query_buffer_size=3),
+        ngc_eviction_config=SimpleNamespace(query_buffer_size=3, cadence=1),
     )
-    with buffers.batch(["a", "b"], [4, 1], torch.tensor([0, 1, 2, 3, 20])):
+    with buffers.batch(
+        ["a", "b"],
+        [4, 1],
+        torch.tensor([0, 1, 2, 3, 20]),
+        computed_generated_tokens=[4, 21],
+    ):
         buffers.capture(layer, (torch.arange(5.0).view(5, 1, 1),), {})
         layer.layer_name = "layer.1"
         buffers.capture(layer, (torch.arange(5.0).view(5, 1, 1) + 100,), {})
@@ -31,7 +36,9 @@ def test_query_history_follows_requests_and_layers_across_batch_reordering():
     saved = buffers.histories["a", "layer.0"].page_scores
     torch.testing.assert_close(saved.scores, torch.tensor([0.25, 0.75]))
     assert saved.block_ids.tolist() == [7, 2]
-    with buffers.batch(["b", "a"], [1, 1], torch.tensor([21, 4])):
+    with buffers.batch(
+        ["b", "a"], [1, 1], torch.tensor([21, 4]), computed_generated_tokens=[22, 5]
+    ):
         buffers.capture(layer, (torch.tensor([50.0, 60.0]).view(2, 1, 1),), {})
     query, positions = buffers.get_queries("a", "layer.0")
     assert query.flatten().tolist() == [2, 3, 60]
@@ -44,9 +51,96 @@ def test_query_history_follows_requests_and_layers_across_batch_reordering():
     assert ("b", "layer.0") in buffers.histories
 
 
+@pytest.mark.parametrize("cadence", [1, 3, 128])
+@pytest.mark.parametrize("chunks", [[7] + [1] * 260, [3, 4, 120, 9, 131]])
+def test_windowed_capture_scores_same_recent_queries_as_continuous_capture(
+    cadence, chunks
+):
+    """Preserve scorer inputs through prefill, short cadences and crossed boundaries."""
+    buffers = NGCScoringBuffers()
+    layer = SimpleNamespace(
+        layer_name="layer.0",
+        num_heads=1,
+        head_size=1,
+        ngc_eviction_config=SimpleNamespace(query_buffer_size=5, cadence=cadence),
+    )
+    length = 0
+    scored = []
+
+    def score(query, cache, table, kept_len, scale, **kwargs):
+        expected = torch.arange(max(0, length - 5), length)
+        torch.testing.assert_close(kwargs["query_positions"], expected)
+        torch.testing.assert_close(query.flatten(), expected.float())
+        scored.append(length)
+        return torch.ones((length + 15) // 16)
+
+    for chunk in chunks:
+        positions = torch.arange(length, length + chunk)
+        length += chunk
+        generated = length - 7
+        with buffers.batch(
+            ["a"], [chunk], positions, computed_generated_tokens=[generated]
+        ):
+            buffers.capture(layer, (positions.float().view(-1, 1, 1),), {})
+        pages = torch.arange((length + 15) // 16)
+        buffers.score_if_due(
+            "a",
+            layer.layer_name,
+            group_id=0,
+            computed_generated_tokens=max(generated, 0),
+            cadence=cadence,
+            eviction_rate=0,
+            min_retained_tokens=1,
+            key_cache=torch.empty(0),
+            kernel_block_table=pages,
+            block_ids=pages,
+            key_positions=torch.arange(length),
+            page_size=16,
+            softmax_scale=1,
+            score_fn=score,
+        )
+    assert scored
+
+
+def test_capture_skips_idle_steps_and_invalidates_old_proposals():
+    buffers = NGCScoringBuffers()
+    layer = SimpleNamespace(
+        layer_name="layer.0",
+        num_heads=1,
+        head_size=1,
+        ngc_eviction_config=SimpleNamespace(query_buffer_size=5, cadence=128),
+    )
+
+    def capture(count):
+        with buffers.batch(
+            ["a"], [1], torch.tensor([count + 99]), computed_generated_tokens=[count]
+        ):
+            buffers.capture(layer, (torch.tensor([float(count)]).view(1, 1, 1),), {})
+
+    capture(123)
+    assert not buffers.histories
+    for count in range(124, 129):
+        capture(count)
+    history = buffers.histories["a", layer.layer_name]
+    assert history.queries.flatten().tolist() == [124, 125, 126, 127, 128]
+    before = history.queries.clone()
+    buffers._scored_boundaries["a", layer.layer_name] = 128
+    history.page_scores = object()
+    history.decision = object()
+    for count in range(129, 252):
+        capture(count)
+    assert history.count == 0
+    assert history.page_scores is None and history.decision is None
+    torch.testing.assert_close(history.queries, before)
+    for count in range(252, 257):
+        capture(count)
+    assert history.queries.flatten().tolist() == [252, 253, 254, 255, 256]
+
+
 @pytest.mark.parametrize(
     "scores,length,rate,minimum,expected",
     [
+        ([0.2, 0.1, 0.3, 0.0], 64, 0.0, 1, []),
         ([0.2, 0.1, 0.3, 0.0], 64, 0.5, 1, [1]),
         ([0.2, 0.1, 0.3, 0.0], 49, 0.5, 1, [1]),
         ([0.2, 0.1, 0.3, 0.0], 64, 0.9, 48, [1]),
@@ -70,11 +164,13 @@ def test_scoring_cadence_reduction_and_preemption_replay():
         layer_name="layer.0",
         num_heads=1,
         head_size=1,
-        ngc_eviction_config=SimpleNamespace(query_buffer_size=2),
+        ngc_eviction_config=SimpleNamespace(query_buffer_size=2, cadence=2),
     )
 
     def capture():
-        with buffers.batch(["a"], [2], torch.tensor([62, 63])):
+        with buffers.batch(
+            ["a"], [2], torch.tensor([62, 63]), computed_generated_tokens=[2]
+        ):
             buffers.capture(layer, (torch.ones(2, 1, 1),), {})
 
     capture()

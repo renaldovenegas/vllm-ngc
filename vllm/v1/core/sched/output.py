@@ -298,6 +298,7 @@ class SchedulerOutput:
 
     # Unique snapshot versions, invalidated on rescheduling or freeing a request.
     ngc_table_versions: dict[str, int] = field(default_factory=dict)
+    # Only layouts compacted by eviction since the request was last scheduled.
     ngc_cache_updates: dict[str, dict[int, NGCCacheUpdate]] = field(
         default_factory=dict
     )

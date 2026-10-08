@@ -515,8 +515,12 @@ class GPUModelRunner(
         self.ngc_scoring_buffers = NGCScoringBuffers()
         self._ngc_capture_hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._ngc_scoring_layers: list[tuple[int, Attention]] = []
-        self._ngc_cache_updates: dict[str, dict[int, NGCCacheUpdate]] = {}
-        self._ngc_evicted_cpu: dict[int, torch.Tensor] = {}
+        # Last compacted layout per request and NGC group; absent means none.
+        self._ngc_layouts: dict[str, dict[int, NGCCacheUpdate]] = {}
+        self._ngc_columns: dict[int, int] = {}
+        self._ngc_evicted: CpuGpuBuffer | None = None
+        self._ngc_evicted_rows = 0
+        self._ngc_evicted_any: np.ndarray | None = None
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
@@ -1221,6 +1225,7 @@ class GPUModelRunner(
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.ngc_scoring_buffers.discard_request(req_id)
+            self._ngc_layouts.pop(req_id, None)
             req_state = self.requests.pop(req_id, None)
             self._on_request_state_removed(req_id, req_state)
             self.num_prompt_logprobs.pop(req_id, None)
@@ -1260,6 +1265,7 @@ class GPUModelRunner(
         resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
         for req_id in resumed_req_ids | (scheduler_output.preempted_req_ids or set()):
             self.ngc_scoring_buffers.discard_request(req_id, keep_cadence=True)
+            self._ngc_layouts.pop(req_id, None)
         # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
         # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
         # apart from the forced-preemption case in reset_prefix_cache. And in
@@ -1541,9 +1547,9 @@ class GPUModelRunner(
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
-        self._ngc_cache_updates = scheduler_output.ngc_cache_updates
-        for req_id, updates in self._ngc_cache_updates.items():
+        for req_id, updates in scheduler_output.ngc_cache_updates.items():
             req_index = self.input_batch.req_id_to_index[req_id]
+            self._ngc_layouts.setdefault(req_id, {}).update(updates)
             for group_id, update in updates.items():
                 block_ids = list(update.block_ids)
                 self.requests[req_id].block_ids[group_id][:] = block_ids
@@ -2232,22 +2238,11 @@ class GPUModelRunner(
         )
         self.seq_lens[num_reqs:].fill_(0)
 
-        self._ngc_evicted_cpu = {}
+        self._prepare_ngc_evicted(num_reqs)
         for group_id, table in enumerate(self.input_batch.block_table.block_tables):
             cache_positions = self.positions[:total_num_scheduled_tokens]
-            if isinstance(
-                self.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec,
-                NGCEvictionSpec,
-            ):
-                evicted_cpu = torch.tensor(
-                    [
-                        self._ngc_cache_updates[req_id][group_id].evicted_tokens
-                        for req_id in self.input_batch.req_ids[:num_reqs]
-                    ],
-                    dtype=torch.int32,
-                )
-                self._ngc_evicted_cpu[group_id] = evicted_cpu
-                evicted = evicted_cpu.to(self.device)
+            evicted = self._get_ngc_evicted_gpu(group_id, num_reqs)
+            if evicted is not None:
                 cache_positions = cache_positions - evicted[req_indices_gpu]
             table.compute_slot_mapping(
                 num_reqs, self.query_start_loc.gpu[: num_reqs + 1], cache_positions
@@ -2668,15 +2663,18 @@ class GPUModelRunner(
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
-            if (
-                isinstance(kv_cache_group.kv_cache_spec, NGCEvictionSpec)
-                and num_scheduled_tokens is not None
-                and not for_cudagraph_capture
-            ):
-                evicted = torch.zeros(num_reqs_padded, dtype=torch.int32)
-                evicted[:num_reqs] = self._ngc_evicted_cpu[kv_cache_gid]
-                retained = self.optimistic_seq_lens_cpu[:num_reqs_padded] - evicted
-                cm.seq_lens = retained.to(self.device)
+            evicted = (
+                self._get_ngc_evicted_gpu(kv_cache_gid, num_reqs_padded)
+                if num_scheduled_tokens is not None and not for_cudagraph_capture
+                else None
+            )
+            if evicted is not None:
+                assert self._ngc_evicted is not None
+                evicted_cpu = self._ngc_evicted.cpu[
+                    :num_reqs_padded, self._ngc_columns[kv_cache_gid]
+                ]
+                retained = self.optimistic_seq_lens_cpu[:num_reqs_padded] - evicted_cpu
+                cm.seq_lens = cm.seq_lens - evicted
                 cm._seq_lens_cpu = retained
                 cm.seq_lens_cpu_upper_bound = retained
                 cm._num_computed_tokens_cpu = None
@@ -4583,6 +4581,11 @@ class GPUModelRunner(
                 self.input_batch.req_ids[:num_reqs],
                 num_scheduled_tokens_np[:num_reqs].tolist(),
                 positions,
+                computed_generated_tokens=[
+                    int(self.optimistic_seq_lens_cpu[i])
+                    - self.requests[req_id].num_prompt_tokens
+                    for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs])
+                ],
             )
             if self._ngc_capture_hooks
             else nullcontext(),
@@ -7639,8 +7642,9 @@ class GPUModelRunner(
             for req_index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
                 seq_len = int(self.optimistic_seq_lens_cpu[req_index])
                 generated = max(seq_len - self.requests[req_id].num_prompt_tokens, 0)
-                update = self._ngc_cache_updates[req_id][group_id]
-                retained_len = seq_len - update.evicted_tokens
+                update = self._ngc_layouts.get(req_id, {}).get(group_id)
+                evicted = update.evicted_tokens if update else 0
+                retained_len = seq_len - evicted
                 if (
                     self.ngc_scoring_buffers.due_boundary(
                         req_id, layer.layer_name, generated, policy.cadence
@@ -7663,13 +7667,18 @@ class GPUModelRunner(
                 compact_positions = torch.arange(
                     retained_len, dtype=torch.int64, device=key_cache.device
                 )
-                page_positions = torch.tensor(
-                    update.page_positions, dtype=torch.int64, device=key_cache.device
-                )
-                key_positions = (
-                    page_positions[compact_positions // block_size]
-                    + compact_positions % block_size
-                )
+                # Pages appended after the last compaction stay contiguous.
+                key_positions = compact_positions + evicted
+                if update and update.page_positions:
+                    known = compact_positions[: len(update.page_positions) * block_size]
+                    page_positions = torch.tensor(
+                        update.page_positions,
+                        dtype=torch.int64,
+                        device=key_cache.device,
+                    )
+                    key_positions[: known.numel()] = (
+                        page_positions[known // block_size] + known % block_size
+                    )
                 self.ngc_scoring_buffers.score_if_due(
                     req_id,
                     layer.layer_name,
@@ -7687,6 +7696,35 @@ class GPUModelRunner(
                     reduce_scores=get_tp_group().all_reduce,
                 )
 
+    def _prepare_ngc_evicted(self, num_reqs: int) -> None:
+        """Copy evicted-token offsets for every NGC group to the GPU at once."""
+        if self._ngc_evicted is None:
+            return
+        values = self._ngc_evicted.np
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            layouts = self._ngc_layouts.get(req_id)
+            values[i] = 0
+            if layouts:
+                for group_id, update in layouts.items():
+                    values[i, self._ngc_columns[group_id]] = update.evicted_tokens
+        # Rows past the batch stay zero so padded requests keep their lengths.
+        rows = max(num_reqs, self._ngc_evicted_rows)
+        values[num_reqs:rows] = 0
+        self._ngc_evicted_any = values[:num_reqs].any(axis=0)
+        if self._ngc_evicted_any.any():
+            self._ngc_evicted.copy_to_gpu(rows)
+            self._ngc_evicted_rows = num_reqs
+
+    def _get_ngc_evicted_gpu(self, group_id: int, num_reqs: int) -> torch.Tensor | None:
+        """Return a group's offsets, or None when none of its tokens are evicted."""
+        column = self._ngc_columns.get(group_id)
+        if column is None or self._ngc_evicted_any is None:
+            return None
+        if not self._ngc_evicted_any[column]:
+            return None
+        assert self._ngc_evicted is not None
+        return self._ngc_evicted.gpu[:num_reqs, column]
+
     def _initialize_ngc_capture(self, kv_cache_config: KVCacheConfig) -> None:
         from vllm.v1.kv_cache_interface import KVQuantMode, NGCEvictionSpec
 
@@ -7695,6 +7733,11 @@ class GPUModelRunner(
         self._ngc_capture_hooks = []
         self._ngc_scoring_layers = []
         self.ngc_scoring_buffers = NGCScoringBuffers()
+        self._ngc_layouts = {}
+        self._ngc_columns = {}
+        self._ngc_evicted = None
+        self._ngc_evicted_rows = 0
+        self._ngc_evicted_any = None
         layers = self.compilation_config.static_forward_context
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
             if not isinstance(group.kv_cache_spec, NGCEvictionSpec):
@@ -7760,6 +7803,14 @@ class GPUModelRunner(
                 layer.register_forward_pre_hook(
                     self.ngc_scoring_buffers.capture, with_kwargs=True
                 )
+            )
+        if self._ngc_scoring_layers:
+            self._ngc_columns = {
+                group_id: column
+                for column, (group_id, _) in enumerate(self._ngc_scoring_layers)
+            }
+            self._ngc_evicted = self._make_buffer(
+                self.max_num_reqs, len(self._ngc_columns), dtype=torch.int32
             )
 
     def init_routed_experts_capturer(self):

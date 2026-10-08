@@ -1411,8 +1411,9 @@ class Scheduler(SchedulerInterface):
 
         if self._ngc_groups:
             scheduler_output.ngc_cache_updates = {
-                req_id: self.kv_cache_manager.get_ngc_cache_updates(req_id)
+                req_id: updates
                 for req_id in num_scheduled_tokens
+                if (updates := self.kv_cache_manager.take_ngc_cache_updates(req_id))
             }
             scheduler_output.ngc_table_versions = {
                 req_id: self.ngc_eviction_inbox.schedule(req_id)
@@ -1957,9 +1958,9 @@ class Scheduler(SchedulerInterface):
                         computed_tokens=request.num_computed_tokens,
                         prompt_tokens=request.num_prompt_tokens,
                         in_flight_tokens=request.num_in_flight_tokens,
-                        evicted_tokens=self.kv_cache_manager.get_ngc_cache_updates(
-                            req_id
-                        )[proposal.group_id].evicted_tokens,
+                        evicted_tokens=self.kv_cache_manager.get_ngc_evicted_tokens(
+                            req_id, proposal.group_id
+                        ),
                     )
 
             req_index = model_runner_output.req_id_to_index[req_id]

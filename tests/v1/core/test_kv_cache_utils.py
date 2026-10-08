@@ -2475,9 +2475,11 @@ def test_ngc_layers_get_independent_groups_with_identical_specs(include_full):
         assert after[group_id] == (
             original_ids[2:] if group_id == gid else original_ids
         )
-    updates = manager.get_ngc_cache_updates(request.request_id)
+    updates = manager.take_ngc_cache_updates(request.request_id)
+    assert list(updates) == [gid]
     assert updates[gid].evicted_tokens == 32
-    assert all(u.evicted_tokens == 0 for i, u in updates.items() if i != gid)
+    assert manager.get_ngc_evicted_tokens(request.request_id, gid) == 32
+    assert not manager.take_ngc_cache_updates(request.request_id)
 
 
 def test_mla_draft_prefers_standard_layout_when_pages_can_be_unified():

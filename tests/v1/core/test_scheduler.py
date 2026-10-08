@@ -91,7 +91,8 @@ def test_ngc_scheduler_applies_completed_proposal_before_next_allocation(
         ),
     )
     decode = scheduler.schedule()
-    original = decode.ngc_cache_updates[rid][0]
+    assert not decode.ngc_cache_updates, "Uncompacted layouts are not resent"
+    block_ids = tuple(scheduler.kv_cache_manager.get_block_ids(rid)[0])
     proposal = NGCEvictionProposal(
         request_id=rid,
         layer_name="layer",
@@ -101,10 +102,10 @@ def test_ngc_scheduler_applies_completed_proposal_before_next_allocation(
         computed_generated_tokens=1,
         retained_tokens=65,
         page_size=16,
-        block_ids=original.block_ids,
+        block_ids=block_ids,
         scores=(0.9, 0.1, 0.2, 0.8, 0.0),
         victim_indices=(1, 2),
-        victim_block_ids=(original.block_ids[1], original.block_ids[2]),
+        victim_block_ids=(block_ids[1], block_ids[2]),
     )
     free_before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
     scheduler.update_from_output(
@@ -122,9 +123,9 @@ def test_ngc_scheduler_applies_completed_proposal_before_next_allocation(
     assert update.evicted_tokens == 32
     assert update.page_positions == (0, 48, 64)
     assert update.block_ids == (
-        original.block_ids[0],
-        original.block_ids[3],
-        original.block_ids[4],
+        block_ids[0],
+        block_ids[3],
+        block_ids[4],
     )
     assert (
         scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == free_before + 2
@@ -132,6 +133,13 @@ def test_ngc_scheduler_applies_completed_proposal_before_next_allocation(
     assert request.num_computed_tokens == 66
     assert next_step.scheduled_cached_reqs.num_computed_tokens == [65]
     assert not scheduler.ngc_eviction_inbox.pending
+    scheduler.update_from_output(
+        next_step,
+        ModelRunnerOutput(
+            req_ids=[rid], req_id_to_index={rid: 0}, sampled_token_ids=[[12]]
+        ),
+    )
+    assert not scheduler.schedule().ngc_cache_updates
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
