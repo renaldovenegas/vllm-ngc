@@ -29,7 +29,7 @@ source uploads.
 # Narrow the selection while debugging.
 .venv/bin/modal run tools/ngc_modal.py --job kernels --selector ngc_compacted
 
-# Two requests, alternating NGC/full-attention layers, repeated eviction.
+# Two requests, NGC in every decoder layer, repeated eviction.
 .venv/bin/modal run tools/ngc_modal.py --job smoke
 
 # Full attention vs zero-rate NGC, fresh engines on the same GPU.
@@ -39,14 +39,14 @@ NGC_MODAL_GPU=A100 .venv/bin/modal run --detach tools/ngc_modal.py \
 
 The smoke test defaults to the public `Qwen/Qwen3-0.6B` model. It runs the V1
 model runner in-process with synchronous eager execution, Triton attention,
-FP16 KV, and no prefix caching. Its process-local hooks opt alternating layers
+FP16 KV, and no prefix caching. Its process-local hooks opt every decoder layer
 into NGC without changing the model implementation. It asserts that both requests
 generate 2048 tokens and every NGC layer performs multiple nonempty evictions;
 each eviction must increase the block pool's free count by the number of victims.
 This is a functional smoke test, not a model-quality evaluation.
 
 The zero-equivalence job generates 512 greedy tokens for each of two
-chat-formatted prompts. NGC uses alternating layers, rate zero, and cadence 128.
+chat-formatted prompts. NGC uses every decoder layer, rate zero, and cadence 128.
 Scoring remains active; the job checks zero-victim decisions at 128, 256, and
 384 generated tokens per request/layer and verifies no pages are freed by
 eviction. It requires identical prompt/output tokens and selected-token log
@@ -62,7 +62,7 @@ NGC_MODAL_GPU=A100 .venv/bin/modal run --detach tools/ngc_modal.py \
   --job speed --model Qwen/Qwen2.5-7B-Instruct --submit-only
 ```
 
-This compares full attention with alternating-layer NGC rates 0, 0.10, 0.25,
+This compares full attention with all-layer NGC rates 0, 0.10, 0.25,
 0.50, and 0.75 at cadence 128, using the same GPU allocation and a fixed shuffled
 configuration order. Each fresh engine runs one 2048-token warmup followed by
 three timed 2048-token generations of one chat-formatted fantasy-story prompt.

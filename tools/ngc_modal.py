@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BASE_COMMIT = "1f76efaa2195485b92cb04215aba6fb8f5fe523d"
 GPU = os.environ.get("NGC_MODAL_GPU", "L4")
 REMOTE_ROOT = Path("/opt/vllm")
+UPSTREAM_ROOT = Path("/opt/upstream")
 PYTHON = str(REMOTE_ROOT / ".venv/bin/python")
 BUILD_INPUTS = [
     "csrc",
@@ -114,6 +115,10 @@ image = (
         "/ngc-source/test_triton_unified_attention.py",
     )
     .add_local_file(ROOT / "tools/ngc_modal_runner.py", "/ngc-source/runner.py")
+    .add_local_file(
+        ROOT / "tests/v1/worker/test_gpu_input_batch.py",
+        "/ngc-source/test_gpu_input_batch.py",
+    )
     .add_local_file(ROOT / "tools/ngc_modal_benchmark.py", "/ngc-source/benchmark.py")
 )
 
@@ -135,6 +140,14 @@ def run_tests(job: str, selector: str, model: str, revision: str) -> dict:
         if path.is_file():
             source_hash.update(str(path.relative_to("/ngc-source")).encode())
             source_hash.update(path.read_bytes())
+    if job == "speed-upstream":
+        # Snapshot the pristine base commit, with its compiled extensions,
+        # before this checkout's source is overlaid.
+        shutil.copytree(REMOTE_ROOT / "vllm", UPSTREAM_ROOT / "vllm")
+        shutil.copyfile(
+            "/ngc-source/benchmark.py", UPSTREAM_ROOT / "ngc_modal_benchmark.py"
+        )
+        os.environ["NGC_UPSTREAM_ROOT"] = str(UPSTREAM_ROOT)
     tracked = subprocess.check_output(
         ["git", "ls-files", "vllm"], cwd=REMOTE_ROOT, text=True
     ).splitlines()
@@ -146,6 +159,10 @@ def run_tests(job: str, selector: str, model: str, revision: str) -> dict:
     shutil.copyfile("/ngc-source/benchmark.py", REMOTE_ROOT / "ngc_modal_benchmark.py")
     test_path = REMOTE_ROOT / "tests/kernels/attention/test_triton_unified_attention.py"
     shutil.copyfile("/ngc-source/test_triton_unified_attention.py", test_path)
+    shutil.copyfile(
+        "/ngc-source/test_gpu_input_batch.py",
+        REMOTE_ROOT / "tests/v1/worker/test_gpu_input_batch.py",
+    )
     run_id = f"{job}-{uuid4().hex[:12]}"
     result_dir = Path("/cache/results") / run_id
     result_dir.mkdir(parents=True)
@@ -219,6 +236,8 @@ def main(
         "profile",
         "capture-speed",
         "speed-long",
+        "speed-upstream",
+        "step-trace",
     }:
         raise ValueError("Unknown job")
     revision = check_checkout()

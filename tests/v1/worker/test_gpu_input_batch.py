@@ -26,6 +26,69 @@ DEVICES = [f"{DEVICE_TYPE}:{i}" for i in range(min(current_platform.device_count
 MAX_NUM_PROMPT_TOKENS = 64
 
 
+@pytest.mark.parametrize("device", ["cpu"] + DEVICES)
+def test_batched_ngc_tables_preserve_independent_updates(device, monkeypatch):
+    """Packing transfers preserves layer tables through eviction and batch churn."""
+    kwargs = dict(
+        max_num_reqs=4,
+        max_num_batched_tokens=16,
+        pin_memory=device != "cpu",
+        device=torch.device(device),
+        block_sizes=[16, 16, 32],
+        kernel_block_sizes=[16, 16, 16],
+        max_num_blocks=[8, 16, 8],
+    )
+    separate = MultiGroupBlockTable(**kwargs)
+    packed = MultiGroupBlockTable(**kwargs, batched_group_ids=(0, 2))
+    copies = []
+    original_copy = CpuGpuBuffer.copy_to_gpu
+
+    def track_copy(buffer, n=None):
+        copies.append(buffer)
+        return original_copy(buffer, n)
+
+    monkeypatch.setattr(CpuGpuBuffer, "copy_to_gpu", track_copy)
+
+    def commit_and_compare(num_reqs):
+        separate.commit_block_table(num_reqs)
+        copies.clear()
+        packed.commit_block_table(num_reqs)
+        assert len(copies) == 2, "One NGC transfer plus the ordinary group's transfer"
+        for expected, actual in zip(separate.block_tables, packed.block_tables):
+            torch.testing.assert_close(actual.block_table.gpu, expected.block_table.gpu)
+            np.testing.assert_array_equal(
+                actual.num_blocks_per_row, expected.num_blocks_per_row
+            )
+
+    for tables in (separate, packed):
+        tables.add_row(([1, 2, 3], [10, 11], [20, 21]), 0)
+        tables.add_row(([4, 5], [12, 13], [22, 23]), 1)
+    commit_and_compare(2)
+
+    if device != "cpu":
+        starts = torch.tensor([0, 2, 3], dtype=torch.int32, device=device)
+        positions = torch.tensor([0, 17, 31], dtype=torch.int64, device=device)
+        for tables in (separate, packed):
+            tables.compute_slot_mapping(2, starts, positions)
+        for expected, actual in zip(separate.block_tables, packed.block_tables):
+            torch.testing.assert_close(
+                actual.slot_mapping.gpu[:3], expected.slot_mapping.gpu[:3]
+            )
+
+    for tables in (separate, packed):
+        tables[0].add_row([1, 3], 0)  # Evict only from the first NGC layer.
+        tables.append_row(([6], [], [24]), 1)
+        tables.swap_row(0, 1)
+    commit_and_compare(2)
+    for tables in (separate, packed):
+        tables.move_row(1, 2)
+        tables.clear_row(0)
+    commit_and_compare(3)
+    for tables in (separate, packed):
+        tables.add_row(([7], [14], [25]), 0)
+    commit_and_compare(1)
+
+
 def _compare_objs(obj1, obj2, skip: Sequence = ("logitsprocs", "batch_update_builder")):
     attrs = inspect.getmembers(obj1, lambda a: not (inspect.isroutine(a)))
     attr_names = set(

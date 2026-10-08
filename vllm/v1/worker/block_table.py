@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+from copy import copy
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -66,6 +67,7 @@ class BlockTable:
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
         slot_mapping_mode: SlotMappingMode = SlotMappingMode.TOKEN_TO_KV_SLOT,
+        block_table: CpuGpuBuffer | None = None,
     ):
         """
         Args:
@@ -81,6 +83,7 @@ class BlockTable:
             slot_mapping_mode: How this cache group maps scheduled tokens to
                 cache slots. Mamba-like state caches do not use token slot
                 mappings and should use SlotMappingMode.NONE.
+            block_table: Optional view into shared transfer storage.
         """
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -111,8 +114,12 @@ class BlockTable:
 
         self.max_num_blocks_per_req = max_num_blocks_per_req * self.blocks_per_kv_block
 
-        self.block_table = self._make_buffer(
-            self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
+        self.block_table = (
+            block_table
+            if block_table is not None
+            else self._make_buffer(
+                self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
+            )
         )
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
 
@@ -299,6 +306,7 @@ class MultiGroupBlockTable:
         max_num_blocks: list[int],
         cp_kv_cache_interleave_size: int = 1,
         slot_mapping_modes: list[SlotMappingMode] | None = None,
+        batched_group_ids: tuple[int, ...] = (),
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
@@ -330,6 +338,42 @@ class MultiGroupBlockTable:
             )
         ]
 
+        self._batched_block_table: CpuGpuBuffer | None = None
+        shared_tables: dict[int, CpuGpuBuffer] = {}
+        if len(set(batched_group_ids)) != len(batched_group_ids) or any(
+            i < 0 or i >= len(block_sizes) for i in batched_group_ids
+        ):
+            raise ValueError("Batched group IDs must be unique valid group indices")
+        if len(batched_group_ids) > 1:
+            # Pack groups within each request row so the active rows transfer
+            # contiguously. Each layer still has its own table and row counts.
+            widths = {
+                i: get_block_table_width(
+                    max_num_blocks[i],
+                    block_sizes[i],
+                    kernel_block_sizes[i],
+                    token_alignment=None,
+                )
+                for i in batched_group_ids
+            }
+            packed = CpuGpuBuffer(
+                max_num_reqs,
+                sum(widths.values()),
+                dtype=torch.int32,
+                device=device,
+                pin_memory=pin_memory,
+            )
+            self._batched_block_table = packed
+            offset = 0
+            for i, width in widths.items():
+                view = copy(packed)
+                view.cpu = packed.cpu[:, offset : offset + width]
+                view.gpu = packed.gpu[:, offset : offset + width]
+                view.np = view.cpu.numpy()
+                shared_tables[i] = view
+                offset += width
+        self._batched_group_ids = frozenset(shared_tables)
+
         self.block_tables = [
             BlockTable(
                 block_size,
@@ -341,14 +385,15 @@ class MultiGroupBlockTable:
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
                 slot_mapping_mode=slot_mapping_mode,
+                block_table=shared_tables.get(i),
             )
-            for (
+            for i, (
                 block_size,
                 kernel_block_size,
                 max_num_blocks_per_req,
                 slot_mapping_mode,
-            ) in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks, slot_mapping_modes
+            ) in enumerate(
+                zip(block_sizes, kernel_block_sizes, max_num_blocks, slot_mapping_modes)
             )
         ]
 
@@ -382,8 +427,11 @@ class MultiGroupBlockTable:
             block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
 
     def commit_block_table(self, num_reqs: int) -> None:
-        for block_table in self.block_tables:
-            block_table.commit_block_table(num_reqs)
+        if self._batched_block_table is not None:
+            self._batched_block_table.copy_to_gpu(num_reqs)
+        for i, block_table in enumerate(self.block_tables):
+            if i not in self._batched_group_ids:
+                block_table.commit_block_table(num_reqs)
 
     def clear(self) -> None:
         for block_table in self.block_tables:

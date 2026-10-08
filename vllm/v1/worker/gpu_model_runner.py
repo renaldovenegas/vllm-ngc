@@ -7408,15 +7408,18 @@ class GPUModelRunner(
             kv_cache_config: The KV cache configuration.
             kernel_block_sizes: The kernel block sizes for each KV cache group.
         """
-        block_sizes = []
+        block_sizes: list[int] = []
         max_num_blocks = []
         slot_mapping_modes = []
+        batched_group_ids = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group.kv_cache_spec
             kv_cache_spec_kind = get_kv_cache_spec_kind(kv_cache_spec)
             if kv_cache_spec_kind == KVCacheSpecKind.ENCODER_ONLY_ATTENTION:
                 continue
+            if isinstance(kv_cache_spec, NGCEvictionSpec):
+                batched_group_ids.append(len(block_sizes))
             block_size = kv_cache_spec.block_size
             block_sizes.append(block_size)
             if kv_cache_spec_kind == KVCacheSpecKind.MAMBA:
@@ -7433,6 +7436,7 @@ class GPUModelRunner(
             or kernel_block_sizes != self._init_kernel_block_sizes
             or max_num_blocks != self._init_max_num_blocks
             or slot_mapping_modes != self._init_slot_mapping_modes
+            or tuple(batched_group_ids) != getattr(self, "_init_batched_group_ids", ())
             or self.cp_kv_cache_interleave_size
             != self.parallel_config.cp_kv_cache_interleave_size
         ):
@@ -7440,6 +7444,7 @@ class GPUModelRunner(
             self._init_kernel_block_sizes = kernel_block_sizes
             self._init_max_num_blocks = max_num_blocks
             self._init_slot_mapping_modes = slot_mapping_modes
+            self._init_batched_group_ids = tuple(batched_group_ids)
             self.cp_kv_cache_interleave_size = (
                 self.parallel_config.cp_kv_cache_interleave_size
             )
@@ -7462,6 +7467,7 @@ class GPUModelRunner(
                     reasoning_config=self.vllm_config.reasoning_config,
                     use_replayssm=self.cache_config.use_replayssm,
                     slot_mapping_modes=slot_mapping_modes,
+                    batched_group_ids=tuple(batched_group_ids),
                 )
 
         assert self._init_block_sizes == block_sizes, (

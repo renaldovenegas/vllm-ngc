@@ -74,10 +74,9 @@ def smoke(
     def initialize_attention(self, *args, **kwargs):
         bound = signature.bind(self, *args, **kwargs)
         prefix = bound.arguments.get("prefix", "")
-        match = re.search(r"(?:^|\.)layers\.(\d+)\.", prefix)
-        if match is None:
-            raise RuntimeError(f"Cannot identify layer index in {prefix!r}")
-        enabled = ngc_enabled and int(match.group(1)) % 2 == 0
+        if re.search(r"(?:^|\.)layers\.\d+\.", prefix) is None:
+            raise RuntimeError(f"Cannot identify decoder layer in {prefix!r}")
+        enabled = ngc_enabled
         if enabled:
             bound.arguments["ngc_eviction_config"] = NGCEvictionConfig(
                 cadence=128,
@@ -133,7 +132,9 @@ def smoke(
             seed=0,
         )
         assert bool(configured_layers["ngc"]) == ngc_enabled
-        assert configured_layers["full"]
+        assert bool(configured_layers["full"]) != ngc_enabled, (
+            "NGC runs configure every decoder layer"
+        )
         prompts = [
             ("The river flows past the village and into the sea. " * 24) + ending
             for ending in ["Continue the story:", "Describe the landscape:"]
@@ -204,7 +205,7 @@ def smoke(
             assert not events, "Full attention must not evict"
         report = {
             "model": model,
-            "attention_mode": "ngc_alternating" if ngc_enabled else "full",
+            "attention_mode": "ngc_all_layers" if ngc_enabled else "full",
             "chat_template_applied": story or equivalence,
             "zero_decisions": zero_decisions,
             "layers": configured_layers,
@@ -319,6 +320,8 @@ def main() -> None:
             "profile",
             "capture-speed",
             "speed-long",
+            "speed-upstream",
+            "step-trace",
         ],
         required=True,
     )
@@ -327,7 +330,34 @@ def main() -> None:
     parser.add_argument("--result-dir", type=Path, required=True)
     args = parser.parse_args()
     check_environment()
-    if args.job in {"speed", "profile", "capture-speed", "speed-long"}:
+    if args.job in {
+        "speed",
+        "profile",
+        "capture-speed",
+        "speed-long",
+        "speed-upstream",
+        "step-trace",
+    }:
+        trace_args = [
+            "--cases",
+            "full",
+            "0",
+            "0.50",
+            "--output-tokens",
+            "8192",
+            "--warmup-tokens",
+            "384",
+            "--step-trace",
+        ]
+        upstream_args = [
+            "--cases",
+            "upstream",
+            "full",
+            "0",
+            "0.50",
+            "--warmup-tokens",
+            "384",
+        ]
         long_args = [
             "--cases",
             "full",
@@ -349,7 +379,9 @@ def main() -> None:
             ]
             + (["--profile"] if args.job == "profile" else [])
             + (["--compare-capture"] if args.job == "capture-speed" else [])
-            + (long_args if args.job == "speed-long" else []),
+            + (long_args if args.job == "speed-long" else [])
+            + (upstream_args if args.job == "speed-upstream" else [])
+            + (trace_args if args.job == "step-trace" else []),
             check=True,
         )
         return
@@ -363,6 +395,7 @@ def main() -> None:
                 "-o",
                 "addopts=",
                 "tests/kernels/attention/test_triton_unified_attention.py",
+                "tests/v1/worker/test_gpu_input_batch.py",
                 "-k",
                 args.selector,
                 "-v",

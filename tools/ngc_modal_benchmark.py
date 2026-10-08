@@ -3,12 +3,14 @@
 """End-to-end wall-clock rate sweep inside one Modal GPU allocation."""
 
 import argparse
+import contextlib
 import csv
 import functools
 import gzip
 import hashlib
 import inspect
 import json
+import os
 import random
 import shutil
 import statistics
@@ -64,28 +66,130 @@ def continuous_capture(self, layer, args, kwargs):
         history.decision = None
 
 
+@contextlib.contextmanager
+def trace_steps(llm, rows: list[dict], upstream: bool):
+    """Time each engine step and record the KV tokens it attended over.
+
+    Evictions are applied while scheduling, so state read after a step is the
+    retained cache that step's forward pass used, plus its one new token.
+    """
+    engine = llm.llm_engine
+    core = engine.engine_core.engine_core
+    scheduler = core.scheduler
+    managers = []
+    if not upstream:
+        from vllm.v1.core.single_type_kv_cache_manager import NGCEvictionManager
+
+        managers = [
+            manager
+            for manager in scheduler.kv_cache_manager.coordinator.single_type_managers
+            if isinstance(manager, NGCEvictionManager)
+        ]
+    original_step = engine.step
+    original_core_step = core.step_fn
+
+    def core_step():
+        started = time.perf_counter()
+        result = original_core_step()
+        rows.append({"core_ms": (time.perf_counter() - started) * 1e3})
+        return result
+
+    def step():
+        started = time.perf_counter()
+        result = original_step()
+        elapsed = (time.perf_counter() - started) * 1e3
+        request = next(iter(scheduler.requests.values()), None)
+        if rows and "total_ms" not in rows[-1] and request is not None:
+            evicted = [
+                manager.layouts[request.request_id].evicted_tokens
+                for manager in managers
+                if request.request_id in manager.layouts
+            ] or [0]
+            context = request.num_computed_tokens
+            rows[-1].update(
+                total_ms=elapsed,
+                context_tokens=context,
+                prompt_tokens=request.num_prompt_tokens,
+                evicted_tokens_total=sum(evicted),
+                retained_mean=context - sum(evicted) / len(evicted),
+                retained_min=context - max(evicted),
+                retained_max=context - min(evicted),
+            )
+        return result
+
+    engine.step = step
+    core.step_fn = core_step
+    try:
+        yield
+    finally:
+        engine.step = original_step
+        core.step_fn = original_core_step
+
+
+def summarize_steps(runs: list[list[dict]], cadence: int) -> list[dict]:
+    """Median per-step timings across identically seeded runs."""
+    runs = [[row for row in rows if "context_tokens" in row] for rows in runs]
+    assert len({len(rows) for rows in runs}) == 1, "Runs took different steps"
+    steps = []
+    previous = None
+    for index, rows in enumerate(zip(*runs)):
+        first = rows[0]
+        assert all(
+            row["context_tokens"] == first["context_tokens"]
+            and row["evicted_tokens_total"] == first["evicted_tokens_total"]
+            for row in rows
+        ), "Runs diverged in cache state"
+        generated = first["context_tokens"] - first["prompt_tokens"]
+        steps.append(
+            {
+                "step": index,
+                "generated": generated,
+                "context_tokens": first["context_tokens"],
+                "retained_mean": first["retained_mean"],
+                "retained_min": first["retained_min"],
+                "retained_max": first["retained_max"],
+                "scoring_step": previous is not None
+                and generated // cadence > previous["generated"] // cadence,
+                "eviction_step": previous is not None
+                and first["evicted_tokens_total"] > previous["evicted"],
+                "core_ms": statistics.median(row["core_ms"] for row in rows),
+                "total_ms": statistics.median(row["total_ms"] for row in rows),
+                "core_ms_runs": [row["core_ms"] for row in rows],
+            }
+        )
+        previous = {"generated": generated, "evicted": first["evicted_tokens_total"]}
+    return steps
+
+
 def run_case(
     model: str,
     case: str,
     output: Path,
     *,
     profiling: bool = False,
+    step_trace: bool = False,
     output_tokens: int = 2048,
     warmup_tokens: int = 2048,
 ) -> None:
     import torch
 
+    import vllm
     from vllm import LLM, SamplingParams
-    from vllm.config.cache import NGCEvictionConfig
     from vllm.model_executor.layers.attention.attention import Attention
-    from vllm.v1.core.single_type_kv_cache_manager import NGCEvictionManager
-    from vllm.v1.worker.ngc_scoring import NGCScoringBuffers
 
+    # Pristine base commit without NGC code; skip every NGC hook.
+    upstream = case == "upstream"
+    assert not (upstream and profiling), "Profiling annotates NGC code"
     capture_mode, _, rate_text = case.partition("-")
-    rate = None if case == "full" else float(rate_text or case)
-    original_capture = NGCScoringBuffers.capture
-    if capture_mode == "continuous":
-        NGCScoringBuffers.capture = continuous_capture
+    rate = None if case in ("full", "upstream") else float(rate_text or case)
+    if not upstream:
+        from vllm.config.cache import NGCEvictionConfig
+        from vllm.v1.core.single_type_kv_cache_manager import NGCEvictionManager
+        from vllm.v1.worker.ngc_scoring import NGCScoringBuffers
+
+        original_capture = NGCScoringBuffers.capture
+        if capture_mode == "continuous":
+            NGCScoringBuffers.capture = continuous_capture
     original_init = Attention.__init__
     signature = inspect.signature(original_init)
     layers = []
@@ -94,10 +198,9 @@ def run_case(
     def initialize_attention(self, *args, **kwargs):
         bound = signature.bind(self, *args, **kwargs)
         prefix = bound.arguments.get("prefix", "")
-        match = re.search(r"(?:^|\.)layers\.(\d+)\.", prefix)
-        if match is None:
-            raise RuntimeError(f"Cannot identify layer in {prefix!r}")
-        if rate is not None and int(match.group(1)) % 2 == 0:
+        if re.search(r"(?:^|\.)layers\.\d+\.", prefix) is None:
+            raise RuntimeError(f"Cannot identify decoder layer in {prefix!r}")
+        if rate is not None:
             bound.arguments["ngc_eviction_config"] = NGCEvictionConfig(
                 cadence=128,
                 eviction_rate=rate,
@@ -131,7 +234,8 @@ def run_case(
         load_seconds = time.perf_counter() - started
     finally:
         Attention.__init__ = original_init
-        NGCScoringBuffers.capture = original_capture
+        if not upstream:
+            NGCScoringBuffers.capture = original_capture
     assert bool(layers) == (rate is not None)
     prompt = "Write a long fantasy story that is approximately 3000 words."
     tokenizer = llm.get_tokenizer()
@@ -162,26 +266,30 @@ def run_case(
             use_tqdm=False,
         )
 
-    original_evict = NGCEvictionManager.apply_eviction
     warmup_events = []
-
-    @functools.wraps(original_evict)
-    def validate_eviction(self, proposal, computed_tokens):
-        before = self.block_pool.get_num_free_blocks()
-        applied = original_evict(self, proposal, computed_tokens)
-        if applied:
-            assert self.block_pool.get_num_free_blocks() - before == len(
-                proposal.victim_indices
-            )
-            warmup_events.append(len(proposal.victim_indices))
-        return applied
-
-    NGCEvictionManager.apply_eviction = validate_eviction
-    try:
+    if upstream:
         warmup = generate(warmup_tokens)
         torch.accelerator.synchronize()
-    finally:
-        NGCEvictionManager.apply_eviction = original_evict
+    else:
+        original_evict = NGCEvictionManager.apply_eviction
+
+        @functools.wraps(original_evict)
+        def validate_eviction(self, proposal, computed_tokens):
+            before = self.block_pool.get_num_free_blocks()
+            applied = original_evict(self, proposal, computed_tokens)
+            if applied:
+                assert self.block_pool.get_num_free_blocks() - before == len(
+                    proposal.victim_indices
+                )
+                warmup_events.append(len(proposal.victim_indices))
+            return applied
+
+        NGCEvictionManager.apply_eviction = validate_eviction
+        try:
+            warmup = generate(warmup_tokens)
+            torch.accelerator.synchronize()
+        finally:
+            NGCEvictionManager.apply_eviction = original_evict
     assert len(warmup[0].outputs[0].token_ids) == warmup_tokens
     if rate is not None and rate > 0:
         assert sum(warmup_events) > 0, "Warmup must exercise real eviction"
@@ -202,11 +310,18 @@ def run_case(
         jit_monitor._handle_jit_event = record_jit_event
     seconds = []
     output_hashes = []
+    step_runs: list[list[dict]] = []
     for repeat in range(3):
+        rows: list[dict] = []
+        tracing = (
+            trace_steps(llm, rows, upstream) if step_trace else contextlib.nullcontext()
+        )
         torch.accelerator.synchronize()
         started = time.perf_counter()
-        result = generate()
+        with tracing:
+            result = generate()
         torch.accelerator.synchronize()
+        step_runs.append(rows)
         seconds.append(time.perf_counter() - started)
         assert len(result[0].outputs[0].token_ids) == output_tokens
         output_hashes.append(
@@ -221,6 +336,7 @@ def run_case(
     report = {
         "model": model,
         "case": case,
+        "vllm_source": vllm.__file__,
         "capture_mode": "continuous" if capture_mode == "continuous" else "windowed",
         "output_token_hashes": output_hashes,
         "eviction_rate": rate,
@@ -244,6 +360,8 @@ def run_case(
         "warmup_freed_pages": sum(warmup_events),
         "jit_events_after_warmup": jit_events,
     }
+    if step_trace:
+        report["steps"] = summarize_steps(step_runs, cadence=128)
     if profiling:
         print(f"JIT_TIMED_SUMMARY {case} events={len(jit_events)}", flush=True)
         output.write_text(json.dumps(report, indent=2))
@@ -367,6 +485,69 @@ def profile_generation(llm, generate, output: Path) -> dict:
     }
 
 
+def compare_steps(reports: dict, cases: list[str], result_dir: Path) -> dict:
+    """Relate decode-step latency to retained cache size for each case."""
+    fields = [
+        "step",
+        "generated",
+        "context_tokens",
+        "retained_mean",
+        "retained_min",
+        "retained_max",
+        "scoring_step",
+        "eviction_step",
+        "core_ms",
+        "total_ms",
+    ]
+    summary = {}
+    intervals: dict[int, dict] = {}
+    for case in cases:
+        steps = reports[case]["steps"]
+        with (result_dir / f"steps-{case}.csv").open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(steps)
+        decode = steps[1:]
+        plain = [s for s in decode if not s["scoring_step"] and not s["eviction_step"]]
+        fit = statistics.linear_regression(
+            [s["retained_mean"] for s in plain], [s["core_ms"] for s in plain]
+        )
+        summary[case] = {
+            "decode_steps": len(decode),
+            "core_ms_per_1k_retained_tokens": fit.slope * 1000,
+            "core_ms_at_zero_retained": fit.intercept,
+            "median_core_ms": statistics.median(s["core_ms"] for s in plain),
+            "median_scoring_step_core_ms": statistics.median(
+                [s["core_ms"] for s in decode if s["scoring_step"]] or [0.0]
+            ),
+            "median_eviction_step_core_ms": statistics.median(
+                [s["core_ms"] for s in decode if s["eviction_step"]] or [0.0]
+            ),
+            "retained_mean_range": [
+                min(s["retained_mean"] for s in decode),
+                max(s["retained_mean"] for s in decode),
+            ],
+        }
+        by_interval: dict[int, list[dict]] = {}
+        for step in decode:
+            by_interval.setdefault(step["generated"] // 128, []).append(step)
+        for interval, members in by_interval.items():
+            row = intervals.setdefault(interval, {"interval": interval})
+            row[f"{case}_retained_mean"] = statistics.mean(
+                s["retained_mean"] for s in members
+            )
+            row[f"{case}_median_core_ms"] = statistics.median(
+                s["core_ms"] for s in members
+            )
+            row[f"{case}_first_step_core_ms"] = members[0]["core_ms"]
+    rows = [intervals[key] for key in sorted(intervals)]
+    with (result_dir / "steps_by_interval.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    return summary
+
+
 def sweep(
     model: str,
     result_dir: Path,
@@ -376,6 +557,7 @@ def sweep(
     cases: list[str] | None = None,
     output_tokens: int = 2048,
     warmup_tokens: int = 2048,
+    step_trace: bool = False,
 ) -> None:
     if cases is None:
         cases = (
@@ -395,12 +577,22 @@ def sweep(
     order = cases.copy()
     random.Random(0).shuffle(order)
     reports = {}
+    upstream_root = os.environ.get("NGC_UPSTREAM_ROOT")
+    if "upstream" in cases and upstream_root is None:
+        raise RuntimeError("The upstream case needs NGC_UPSTREAM_ROOT")
     for case in order:
         output = result_dir / f"speed-{case}.json"
+        script = __file__
+        env = None
+        if case == "upstream":
+            # The script's own directory precedes PYTHONPATH on sys.path.
+            assert upstream_root is not None
+            script = str(Path(upstream_root) / Path(__file__).name)
+            env = dict(os.environ, PYTHONPATH=upstream_root)
         subprocess.run(
             [
                 sys.executable,
-                __file__,
+                script,
                 "--model",
                 model,
                 "--result-dir",
@@ -412,10 +604,18 @@ def sweep(
                 "--warmup-tokens",
                 str(warmup_tokens),
             ]
-            + (["--profile"] if profiling else []),
+            + (["--profile"] if profiling else [])
+            + (["--step-trace"] if step_trace else []),
             check=True,
+            env=env,
         )
         reports[case] = json.loads(output.read_text())
+        expected_root = upstream_root if case == "upstream" else "/opt/vllm"
+        if expected_root is not None:
+            assert reports[case]["vllm_source"].startswith(f"{expected_root}/"), (
+                case,
+                reports[case]["vllm_source"],
+            )
         print(f"NGC_CHECKPOINT {case} {result_dir}", flush=True)
     baseline = reports["full"]
     rows = []
@@ -436,6 +636,9 @@ def sweep(
             }
         )
     summary = {"order": order, "results": rows, "cases": reports}
+    if step_trace:
+        summary["step_trace"] = compare_steps(reports, cases, result_dir)
+        print(json.dumps(summary["step_trace"], indent=2), flush=True)
     if compare_capture:
         comparisons = []
         for rate in ("0", "0.25"):
@@ -472,6 +675,7 @@ if __name__ == "__main__":
     parser.add_argument("--cases", nargs="+")
     parser.add_argument("--output-tokens", type=int, default=2048)
     parser.add_argument("--warmup-tokens", type=int, default=2048)
+    parser.add_argument("--step-trace", action="store_true")
     args = parser.parse_args()
     if args.profile and args.output_tokens != 2048:
         parser.error("The profile window assumes 2048 output tokens")
@@ -484,6 +688,7 @@ if __name__ == "__main__":
             cases=args.cases,
             output_tokens=args.output_tokens,
             warmup_tokens=args.warmup_tokens,
+            step_trace=args.step_trace,
         )
     else:
         run_case(
@@ -493,4 +698,5 @@ if __name__ == "__main__":
             profiling=args.profile,
             output_tokens=args.output_tokens,
             warmup_tokens=args.warmup_tokens,
+            step_trace=args.step_trace,
         )
