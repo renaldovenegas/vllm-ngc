@@ -36,7 +36,8 @@ from vllm.v1.ngc_eviction import NGCEvictionProposal
 pytestmark = pytest.mark.cpu_test
 
 
-def test_ngc_eviction_reclaims_only_victims_and_allocates_after_retained_tail():
+@pytest.mark.parametrize("compact", [False, True])
+def test_ngc_eviction_reclaims_only_victims_and_allocates_after_retained_tail(compact):
     spec = NGCEvictionSpec(
         block_size=4,
         num_kv_heads=1,
@@ -69,6 +70,8 @@ def test_ngc_eviction_reclaims_only_victims_and_allocates_after_retained_tail():
         victim_indices=(0, 2),
         victim_block_ids=(blocks[0].block_id, blocks[2].block_id),
     )
+    if compact:
+        proposal = replace(proposal, block_ids=None, scores=None)
     assert not manager.apply_eviction(replace(proposal, victim_block_ids=(-1, -2)), 17)
     assert pool.get_num_free_blocks() == free_before
     assert manager.apply_eviction(proposal, 17)
@@ -80,6 +83,7 @@ def test_ngc_eviction_reclaims_only_victims_and_allocates_after_retained_tail():
     assert not manager.apply_eviction(proposal, 17)
     assert manager.get_num_blocks_to_allocate("a", 20, [], 17, 17, 20) == 0
     assert not manager.allocate_new_blocks("a", 20, 20)
+    assert manager.get_cache_update("a") == update
     assert manager.get_num_blocks_to_allocate("a", 21, [], 20, 20, 21) == 1
     assert len(manager.allocate_new_blocks("a", 21, 21)) == 1
     assert manager.get_cache_update("a").page_positions == (4, 12, 16, 20)
@@ -88,6 +92,50 @@ def test_ngc_eviction_reclaims_only_victims_and_allocates_after_retained_tail():
     replay = manager.get_cache_update("a")
     assert replay.page_positions == (0, 4) and replay.evicted_tokens == 0
     assert manager.get_cache_update("b").block_ids == tuple(b.block_id for b in other)
+
+
+@pytest.mark.parametrize("rate", [0.0, 0.5])
+def test_ngc_zero_victim_proposal_does_not_dirty_or_rebuild_layout(rate):
+    spec = NGCEvictionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+        eviction_rate=rate,
+        min_retained_tokens=17,
+    )
+    pool = BlockPool(num_gpu_blocks=16, enable_caching=False, hash_block_size=4)
+    manager = NGCEvictionManager(
+        spec, pool, enable_caching=False, kv_cache_group_id=0, scheduler_block_size=4
+    )
+    manager.allocate_new_blocks("a", 17, 17)
+    blocks = manager.req_to_blocks["a"]
+    positions = manager.layouts["a"].page_positions
+    free_before = pool.get_num_free_blocks()
+    proposal = NGCEvictionProposal(
+        request_id="a",
+        layer_name="layer.0",
+        group_id=0,
+        table_version=1,
+        cadence_boundary=1,
+        computed_generated_tokens=1,
+        retained_tokens=17,
+        page_size=4,
+        block_ids=None,
+        scores=None,
+        victim_indices=(),
+        victim_block_ids=(),
+    )
+    assert not manager.apply_eviction(replace(proposal, retained_tokens=16), 17)
+    assert not manager.apply_eviction(replace(proposal, victim_block_ids=(1,)), 17)
+    assert manager.apply_eviction(proposal, 17)
+    assert "a" not in manager.changed_requests
+    assert manager.req_to_blocks["a"] is blocks
+    assert manager.layouts["a"].page_positions is positions
+    assert pool.get_num_free_blocks() == free_before
+    manager.changed_requests.add("a")
+    assert manager.apply_eviction(proposal, 17)
+    assert "a" in manager.changed_requests
 
 
 def test_external_computed_blocks_do_not_corrupt_free_pool():
@@ -839,3 +887,104 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_ngc_batched_allocation_preserves_layer_layouts(mixed):
+    """Batched allocation matches individual managers through eviction and reuse."""
+    from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinatorNoPrefixCache
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+
+    specs = [
+        NGCEvictionSpec(
+            block_size=size,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float16,
+            eviction_rate=0.5,
+        )
+        for size in (4, 8)
+    ]
+    if mixed:
+        specs.append(
+            FullAttentionSpec(
+                block_size=4, num_kv_heads=1, head_size=8, dtype=torch.float16
+            )
+        )
+    config = KVCacheConfig(
+        128,
+        [],
+        [KVCacheGroupSpec([f"layer.{i}"], spec) for i, spec in enumerate(specs)],
+    )
+
+    def make_coordinator():
+        return KVCacheCoordinatorNoPrefixCache(
+            config, 128, 128, False, False, 1, 1, 8, 4
+        )
+
+    batched, reference = make_coordinator(), make_coordinator()
+    reference._all_ngc = False
+    for coordinator in (batched, reference):
+        for manager in coordinator.single_type_managers:
+            manager._record_new_block_ids = True
+
+    def allocate(request_id, tokens):
+        sizes = []
+        for coordinator in (batched, reference):
+            needed = coordinator.get_num_blocks_to_allocate(
+                request_id, tokens, tuple([] for _ in specs), 0, 0, 0, tokens
+            )
+            blocks = coordinator.allocate_new_blocks(request_id, tokens, tokens)
+            assert sum(map(len, blocks)) == needed
+            for manager, allocated in zip(coordinator.single_type_managers, blocks):
+                assert manager.take_new_block_ids() == [
+                    block.block_id for block in allocated
+                ]
+            sizes.append([[b.block_id for b in group] for group in blocks])
+        assert sizes[0] == sizes[1]
+        assert (
+            batched.block_pool.get_num_free_blocks()
+            == reference.block_pool.get_num_free_blocks()
+        )
+        for left, right in zip(
+            batched.single_type_managers, reference.single_type_managers
+        ):
+            assert [b.block_id for b in left.req_to_blocks[request_id]] == [
+                b.block_id for b in right.req_to_blocks[request_id]
+            ]
+            if isinstance(left, NGCEvictionManager):
+                assert left.get_cache_update(request_id) == right.get_cache_update(
+                    request_id
+                )
+
+    allocate("a", 17)
+    allocate("b", 8)
+    for coordinator in (batched, reference):
+        manager = coordinator.single_type_managers[0]
+        blocks = manager.req_to_blocks["a"]
+        proposal = NGCEvictionProposal(
+            request_id="a",
+            layer_name="layer.0",
+            group_id=0,
+            table_version=1,
+            cadence_boundary=32,
+            computed_generated_tokens=32,
+            retained_tokens=17,
+            page_size=4,
+            block_ids=None,
+            scores=None,
+            victim_indices=(0, 2),
+            victim_block_ids=(blocks[0].block_id, blocks[2].block_id),
+        )
+        assert manager.apply_eviction(proposal, 17)
+    allocate("a", 20)
+    allocate("a", 21)
+    allocate("a", 41)
+    for coordinator in (batched, reference):
+        coordinator.free("a")
+    allocate("a", 5)
+    allocate("b", 9)
+    for coordinator in (batched, reference):
+        blocks = coordinator.pop_blocks_for_free("a")
+        coordinator.block_pool.free_blocks(reversed(blocks))
+    allocate("a", 13)

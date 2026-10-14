@@ -52,8 +52,9 @@ class NGCEvictionProposal:
     computed_generated_tokens: int
     retained_tokens: int
     page_size: int
-    block_ids: tuple[int, ...]
-    scores: tuple[float, ...]
+    # Optional diagnostics; versions and victim IDs validate compact proposals.
+    block_ids: tuple[int, ...] | None
+    scores: tuple[float, ...] | None
     victim_indices: tuple[int, ...]
     victim_block_ids: tuple[int, ...]
 
@@ -109,15 +110,20 @@ class NGCEvictionInbox:
             or p.retained_tokens != computed_tokens - evicted_tokens
             or p.computed_generated_tokens != max(computed_tokens - prompt_tokens, 0)
             or not 0 < p.cadence_boundary <= p.computed_generated_tokens
-            or len(p.block_ids) != num_pages
-            or p.block_ids != tuple(block_ids[:num_pages])
-            or len(p.scores) != num_pages
-            or not all(isfinite(score) for score in p.scores)
+            or len(block_ids) < num_pages
+            or (p.block_ids is not None and p.block_ids != tuple(block_ids[:num_pages]))
+            or (
+                p.scores is not None
+                and (
+                    len(p.scores) != num_pages
+                    or not all(isfinite(score) for score in p.scores)
+                )
+            )
             or len(set(p.victim_indices)) != len(p.victim_indices)
             or any(i < 0 or i >= num_pages - 1 for i in p.victim_indices)
         ):
             return False
-        if p.victim_block_ids != tuple(p.block_ids[i] for i in p.victim_indices):
+        if p.victim_block_ids != tuple(block_ids[i] for i in p.victim_indices):
             return False
         key = (p.request_id, p.group_id)
         if key in self.pending:

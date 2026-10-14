@@ -3,7 +3,9 @@
 """End-to-end wall-clock rate sweep inside one Modal GPU allocation."""
 
 import argparse
+import bisect
 import contextlib
+import cProfile
 import csv
 import functools
 import gzip
@@ -11,6 +13,7 @@ import hashlib
 import inspect
 import json
 import os
+import pstats
 import random
 import shutil
 import statistics
@@ -20,50 +23,6 @@ import time
 from pathlib import Path
 
 import regex as re
-
-
-def continuous_capture(self, layer, args, kwargs):
-    """Previous capture implementation, adapted only to the new batch tuple."""
-    import torch
-
-    from vllm.v1.worker.ngc_scoring import NGCQueryHistory
-
-    if self._positions is None:
-        return
-    query = args[0] if args else kwargs["query"]
-    query = query.reshape(-1, layer.num_heads, layer.head_size)
-    if self._batch and self._batch[-1][2] > query.shape[0]:
-        raise ValueError("NGC capture query count does not cover the prepared batch")
-    capacity = layer.ngc_eviction_config.query_buffer_size
-    for req_id, start, end, _ in self._batch:
-        if start == end:
-            continue
-        key = (req_id, layer.layer_name)
-        history = self.histories.get(key)
-        if history is None:
-            history = NGCQueryHistory(
-                torch.empty(
-                    (capacity, *query.shape[1:]), dtype=query.dtype, device=query.device
-                ),
-                torch.empty(capacity, dtype=torch.int64, device=query.device),
-            )
-            self.histories[key] = history
-        incoming = min(end - start, capacity)
-        old = min(history.count, capacity - incoming)
-        if old:
-            history.queries[:old].copy_(
-                history.queries[history.count - old : history.count].clone()
-            )
-            history.positions[:old].copy_(
-                history.positions[history.count - old : history.count].clone()
-            )
-        history.queries[old : old + incoming].copy_(query[end - incoming : end])
-        history.positions[old : old + incoming].copy_(
-            self._positions[end - incoming : end]
-        )
-        history.count = old + incoming
-        history.page_scores = None
-        history.decision = None
 
 
 @contextlib.contextmanager
@@ -167,7 +126,9 @@ def run_case(
     output: Path,
     *,
     profiling: bool = False,
+    scheduler_profiling: bool = False,
     step_trace: bool = False,
+    num_seqs: int = 1,
     output_tokens: int = 2048,
     warmup_tokens: int = 2048,
 ) -> None:
@@ -178,18 +139,14 @@ def run_case(
     from vllm.model_executor.layers.attention.attention import Attention
 
     # Pristine base commit without NGC code; skip every NGC hook.
-    upstream = case == "upstream"
-    assert not (upstream and profiling), "Profiling annotates NGC code"
-    capture_mode, _, rate_text = case.partition("-")
-    rate = None if case in ("full", "upstream") else float(rate_text or case)
+    # A "-graph" suffix runs the same case with CUDA graphs and torch.compile.
+    use_graphs = case.endswith("-graph")
+    base_case = case.removesuffix("-graph").removeprefix("before-")
+    upstream = base_case == "upstream"
+    rate = None if base_case in ("full", "upstream") else float(base_case)
     if not upstream:
         from vllm.config.cache import NGCEvictionConfig
         from vllm.v1.core.single_type_kv_cache_manager import NGCEvictionManager
-        from vllm.v1.worker.ngc_scoring import NGCScoringBuffers
-
-        original_capture = NGCScoringBuffers.capture
-        if capture_mode == "continuous":
-            NGCScoringBuffers.capture = continuous_capture
     original_init = Attention.__init__
     signature = inspect.signature(original_init)
     layers = []
@@ -217,14 +174,14 @@ def run_case(
             model=model,
             dtype="float16",
             kv_cache_dtype="auto",
-            enforce_eager=True,
+            enforce_eager=not use_graphs,
             async_scheduling=False,
             distributed_executor_backend="uni",
             tensor_parallel_size=1,
             attention_config={"backend": "TRITON_ATTN"},
             block_size=16,
             max_model_len=max(4096, output_tokens + 1024),
-            max_num_seqs=1,
+            max_num_seqs=num_seqs,
             max_num_batched_tokens=1024,
             gpu_memory_utilization=0.65,
             enable_prefix_caching=False,
@@ -234,8 +191,6 @@ def run_case(
         load_seconds = time.perf_counter() - started
     finally:
         Attention.__init__ = original_init
-        if not upstream:
-            NGCScoringBuffers.capture = original_capture
     assert bool(layers) == (rate is not None)
     prompt = "Write a long fantasy story that is approximately 3000 words."
     tokenizer = llm.get_tokenizer()
@@ -259,12 +214,24 @@ def run_case(
     )
 
     def generate(num_tokens: int = output_tokens):
-        params = dict(sampling, min_tokens=num_tokens, max_tokens=num_tokens)
-        return llm.generate(
-            [{"prompt_token_ids": token_ids}],
-            SamplingParams(**params),
-            use_tqdm=False,
+        # Distinct seeds give the batch distinct samples from one prompt.
+        params = [
+            SamplingParams(
+                **dict(
+                    sampling,
+                    min_tokens=num_tokens,
+                    max_tokens=num_tokens,
+                    seed=sampling["seed"] + i,
+                )
+            )
+            for i in range(num_seqs)
+        ]
+        results = llm.generate(
+            [{"prompt_token_ids": token_ids}] * num_seqs, params, use_tqdm=False
         )
+        assert len(results) == num_seqs
+        assert all(len(r.outputs[0].token_ids) == num_tokens for r in results)
+        return results
 
     warmup_events = []
     if upstream:
@@ -323,10 +290,9 @@ def run_case(
         torch.accelerator.synchronize()
         step_runs.append(rows)
         seconds.append(time.perf_counter() - started)
-        assert len(result[0].outputs[0].token_ids) == output_tokens
         output_hashes.append(
             hashlib.sha256(
-                json.dumps(result[0].outputs[0].token_ids).encode()
+                json.dumps([r.outputs[0].token_ids for r in result]).encode()
             ).hexdigest()
         )
         print(
@@ -336,25 +302,47 @@ def run_case(
     report = {
         "model": model,
         "case": case,
+        "enforce_eager": not use_graphs,
         "vllm_source": vllm.__file__,
-        "capture_mode": "continuous" if capture_mode == "continuous" else "windowed",
+        "source_files_sha256": {
+            filename: hashlib.sha256(
+                (Path(vllm.__file__).parent / filename).read_bytes()
+            ).hexdigest()
+            for filename in (
+                "v1/core/kv_cache_coordinator.py",
+                "v1/core/single_type_kv_cache_manager.py",
+                "v1/worker/gpu_model_runner.py",
+                "v1/attention/backends/triton_attn.py",
+                "v1/attention/ops/triton_ngc_inputs.py",
+                "v1/worker/ngc_scoring.py",
+            )
+            if (Path(vllm.__file__).parent / filename).is_file()
+        },
+        "manager_source_sha256": hashlib.sha256(
+            (
+                Path(vllm.__file__).parent / "v1/core/single_type_kv_cache_manager.py"
+            ).read_bytes()
+        ).hexdigest(),
         "output_token_hashes": output_hashes,
         "eviction_rate": rate,
         "gpu": torch.cuda.get_device_name(0),
+        "gpu_uuid": str(
+            getattr(torch.cuda.get_device_properties(0), "uuid", "unknown")
+        ),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "ngc_layers": layers,
         "cadence": 128,
         "query_buffer_size": 5,
         "min_retained_tokens": 32,
-        "batch_size": 1,
+        "batch_size": num_seqs,
         "prompt_token_ids": token_ids,
         "sampling": sampling,
         "output_tokens": output_tokens,
         "warmup_tokens": warmup_tokens,
         "seconds": seconds,
         "median_seconds": median,
-        "tokens_per_second": output_tokens / median,
+        "tokens_per_second": num_seqs * output_tokens / median,
         "model_load_seconds": load_seconds,
         "warmup_eviction_decisions": len(warmup_events),
         "warmup_freed_pages": sum(warmup_events),
@@ -362,21 +350,259 @@ def run_case(
     }
     if step_trace:
         report["steps"] = summarize_steps(step_runs, cadence=128)
+    if scheduler_profiling:
+        output.write_text(json.dumps(report, indent=2))
+        report["scheduler_profile"] = profile_scheduler(llm, generate)
     if profiling:
         print(f"JIT_TIMED_SUMMARY {case} events={len(jit_events)}", flush=True)
         output.write_text(json.dumps(report, indent=2))
         phase = "profile"
-        report["profile"] = profile_generation(llm, generate, output)
+        report["profile"] = profile_generation(llm, generate, output, upstream=upstream)
         jit_monitor._handle_jit_event = original_jit_event
     output.write_text(json.dumps(report, indent=2))
 
 
-def profile_generation(llm, generate, output: Path) -> dict:
+def profile_scheduler(llm, generate) -> dict:
+    """Time coarse scheduler operations, then profile their Python call trees."""
+    scheduler = llm.llm_engine.engine_core.engine_core.scheduler
+    engine = llm.llm_engine
+    original_step = engine.step
+    original_schedule = scheduler.schedule
+    manager = scheduler.kv_cache_manager
+    coordinator = manager.coordinator
+    patches = []
+    passes = {}
+    profiles = {kind: cProfile.Profile() for kind in ("ordinary", "proposals")}
+    active_row = None
+
+    def instrument(owner, name, label):
+        if not hasattr(owner, name):
+            return
+        original = getattr(owner, name)
+
+        @functools.wraps(original)
+        def wrapped(*args, **kwargs):
+            if active_row is None:
+                return original(*args, **kwargs)
+            started = time.perf_counter_ns()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                elapsed = (time.perf_counter_ns() - started) / 1e6
+                values = active_row["operations"].setdefault(label, [0, 0.0])
+                values[0] += 1
+                values[1] += elapsed
+
+        patches.append((owner, name, original))
+        setattr(owner, name, wrapped)
+
+    def run_pass(mode):
+        step_index = 0
+        rows = []
+
+        def schedule(*args, **kwargs):
+            nonlocal active_row
+            if not 1800 <= step_index < 1944:
+                return original_schedule(*args, **kwargs)
+            inbox = getattr(scheduler, "ngc_eviction_inbox", None)
+            pending = len(inbox.pending) if inbox is not None else 0
+            kind = "proposals" if pending else "ordinary"
+            row = {
+                "step": step_index,
+                "kind": kind,
+                "pending_proposals": pending,
+                "running_requests": len(scheduler.running),
+                "operations": {},
+            }
+            active_row = row if mode == "timed" else None
+            started = time.perf_counter_ns()
+            cpu_started = time.thread_time_ns()
+            if mode == "calls":
+                profiles[kind].enable()
+            try:
+                return original_schedule(*args, **kwargs)
+            finally:
+                if mode == "calls":
+                    profiles[kind].disable()
+                row["thread_cpu_ms"] = (time.thread_time_ns() - cpu_started) / 1e6
+                row["wall_ms"] = (time.perf_counter_ns() - started) / 1e6
+                active_row = None
+                rows.append(row)
+
+        def step():
+            nonlocal step_index
+            result = original_step()
+            step_index += 1
+            return result
+
+        scheduler.schedule = schedule
+        engine.step = step
+        generate()
+        assert len(rows) == 144, "Scheduler profile missed the late-decode window"
+        return rows
+
+    try:
+        for mode in ("timed", "calls"):
+            if mode == "timed":
+                for name in (
+                    "allocate_slots",
+                    "take_ngc_cache_updates",
+                    "apply_ngc_eviction",
+                    "get_num_common_prefix_blocks",
+                    "get_block_ids",
+                    "take_new_block_ids",
+                    "take_kv_cache_block_copies",
+                    "take_boundary_state_offloads",
+                    "new_step_starts",
+                ):
+                    instrument(manager, name, "manager." + name)
+                for name in (
+                    "get_num_blocks_to_allocate",
+                    "allocate_new_blocks",
+                    "remove_skipped_blocks",
+                ):
+                    instrument(coordinator, name, "coordinator." + name)
+                instrument(
+                    scheduler, "_make_cached_request_data", "cached_request_data"
+                )
+                instrument(scheduler, "_update_after_schedule", "update_after_schedule")
+            passes[mode] = run_pass(mode)
+            for owner, name, original in reversed(patches):
+                setattr(owner, name, original)
+            patches.clear()
+            print(f"SCHEDULER_PROFILE {mode} steps={len(passes[mode])}", flush=True)
+    finally:
+        scheduler.schedule = original_schedule
+        engine.step = original_step
+        for owner, name, original in reversed(patches):
+            setattr(owner, name, original)
+    functions = {}
+    for kind, profile in profiles.items():
+        rows = []
+        if not any(row["kind"] == kind for row in passes["calls"]):
+            functions[kind] = rows
+            continue
+        for (filename, line, name), values in pstats.Stats(profile).stats.items():
+            primitive, calls, self_seconds, cumulative_seconds, callers = values
+            rows.append(
+                {
+                    "file": filename,
+                    "line": line,
+                    "function": name,
+                    "primitive_calls": primitive,
+                    "calls": calls,
+                    "self_ms": self_seconds * 1000,
+                    "cumulative_ms": cumulative_seconds * 1000,
+                    "callers": [
+                        {
+                            "file": key[0],
+                            "line": key[1],
+                            "function": key[2],
+                            "stats": val,
+                        }
+                        for key, val in callers.items()
+                    ],
+                }
+            )
+        functions[kind] = sorted(rows, key=lambda row: -row["cumulative_ms"])
+    return {
+        "start_step": 1800,
+        "active_steps": 144,
+        "passes": passes,
+        "functions": functions,
+        "note": "Timed pass uses coarse method wrappers; nested operation spans "
+        "overlap. Thread CPU time excludes waiting. Separate cProfile pass adds "
+        "per-call overhead: use it for attribution and counts, not absolute latency. "
+        "Proposals identifies scheduler steps consuming the NGC inbox, including "
+        "zero-victim proposals; ordinary includes block-allocation boundaries.",
+    }
+
+
+def summarize_profile_trace(trace: Path) -> dict:
+    """Measure interval unions, including kernels replayed by CUDA graphs."""
+    opener = gzip.open if trace.suffix == ".gz" else open
+    with opener(trace, "rt") as stream:
+        events = json.load(stream)["traceEvents"]
+    intervals: dict[str, list[tuple[float, float]]] = {}
+    steps = []
+    for event in events:
+        if event.get("ph") != "X" or "dur" not in event:
+            continue
+        name, category = event["name"], event.get("cat", "")
+        span = (event["ts"], event["ts"] + event["dur"])
+        if category == "user_annotation" and name.startswith("ProfilerStep#"):
+            steps.append((name, *span))
+        labels = []
+        if category in {"kernel", "gpu_memcpy", "gpu_memset"}:
+            labels.append("gpu_busy")
+            labels.append("gpu_kernels" if category == "kernel" else "gpu_copies_fills")
+        if category in {"cuda_runtime", "cuda_driver"} and "Synchronize" in name:
+            labels.append("host_sync_api")
+        if category == "user_annotation" and name.startswith(
+            ("worker.", "scheduler.", "NGC.")
+        ):
+            labels.append(name)
+        for label in labels:
+            intervals.setdefault(label, []).append(span)
+
+    merged = {}
+    for label, spans in intervals.items():
+        union = []
+        for start, end in sorted(spans):
+            if union and start <= union[-1][1]:
+                union[-1] = (union[-1][0], max(end, union[-1][1]))
+            else:
+                union.append((start, end))
+        merged[label] = (union, [end for _, end in union])
+
+    def duration(label, start, end):
+        spans, ends = merged.get(label, ([], []))
+        total = 0.0
+        index = bisect.bisect_right(ends, start)
+        for left, right in spans[index:]:
+            if left >= end:
+                break
+            total += max(0.0, min(end, right) - max(start, left))
+        return total / 1000
+
+    rows = []
+    for name, start, end in sorted(steps, key=lambda step: step[1]):
+        row = {label + "_ms": duration(label, start, end) for label in merged}
+        row.update(step=name, wall_ms=(end - start) / 1000)
+        row["gpu_idle_ms"] = row["wall_ms"] - row.get("gpu_busy_ms", 0.0)
+        row["scoring_boundary"] = row.get("NGC.select_victims_ms", 0.0) > 0
+        rows.append(row)
+    assert rows and "gpu_busy" in merged, "Missing CPU steps or CUDA kernel events"
+    summaries = {}
+    for kind in ("all", "ordinary", "scoring_boundary"):
+        selected = [
+            row
+            for row in rows
+            if kind == "all" or row["scoring_boundary"] == (kind == "scoring_boundary")
+        ]
+        summaries[kind] = {
+            "steps": len(selected),
+            "mean_ms": {
+                key: statistics.mean(row[key] for row in selected)
+                for key in rows[0]
+                if key.endswith("_ms") and selected
+            },
+        }
+    return {
+        "summary": summaries,
+        "steps": rows,
+        "note": "GPU busy is the union of kernels/copies/fills across streams. "
+        "Host annotations are inclusive wall spans, including waits, not CPU "
+        "utilization. Synchronization API spans overlap host annotations and GPU "
+        "work. GPU idle includes profiler overhead and is not all CPU compute.",
+    }
+
+
+def profile_generation(llm, generate, output: Path, *, upstream: bool = False) -> dict:
     """Capture late decode including the 1920-token eviction boundary."""
     import torch
 
-    from vllm.v1.core.single_type_kv_cache_manager import NGCEvictionManager
-    from vllm.v1.worker import ngc_scoring
+    from vllm.v1.core.sched.scheduler import Scheduler
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
     patches = []
@@ -396,31 +622,32 @@ def profile_generation(llm, generate, output: Path) -> dict:
 
     def annotate_capture(model):
         for module in model.modules():
-            for key, hook in list(module._forward_pre_hooks.items()):
-                if (
-                    getattr(hook, "__func__", None)
-                    is ngc_scoring.NGCScoringBuffers.capture
-                ):
+            original = getattr(module, "ngc_query_capture", None)
+            if original is None:
+                continue
 
-                    def wrap_capture(original):
-                        @functools.wraps(original)
-                        def wrapped(*args, **kwargs):
-                            with torch.profiler.record_function("NGC.query_capture"):
-                                return original(*args, **kwargs)
+            def wrapped(query, original=original):
+                with torch.profiler.record_function("NGC.query_capture"):
+                    return original(query)
 
-                        return wrapped
+            capture_hooks.append((module, original))
+            module.ngc_query_capture = wrapped
 
-                    capture_hooks.append((module, key, hook))
-                    module._forward_pre_hooks[key] = wrap_capture(hook)
+    if not upstream:
+        from vllm.v1.core.single_type_kv_cache_manager import NGCEvictionManager
+        from vllm.v1.worker import ngc_scoring
 
-    llm.apply_model(annotate_capture)
-    annotate(ngc_scoring.NGCScoringBuffers, "score_if_due", "NGC.score_if_due")
-    annotate(ngc_scoring.NGCEvictionDecision, "to_proposal", "NGC.proposal_to_cpu")
-    annotate(ngc_scoring, "select_ngc_victims", "NGC.select_victims")
-    annotate(NGCEvictionManager, "apply_eviction", "NGC.apply_eviction")
-    annotate(GPUModelRunner, "_score_ngc_pages", "NGC.score_pages")
+        llm.apply_model(annotate_capture)
+        annotate(ngc_scoring.NGCScoringBuffers, "score_if_due", "NGC.score_if_due")
+        annotate(ngc_scoring.NGCScoringBuffers, "_copy_handoff", "NGC.proposal_to_cpu")
+        annotate(ngc_scoring, "select_ngc_victims", "NGC.select_victims")
+        annotate(NGCEvictionManager, "apply_eviction", "NGC.apply_eviction")
+        annotate(GPUModelRunner, "_score_ngc_pages", "NGC.score_pages")
+    annotate(Scheduler, "schedule", "scheduler.schedule")
+    annotate(Scheduler, "update_from_output", "scheduler.update_from_output")
     annotate(GPUModelRunner, "_prepare_inputs", "worker.prepare_inputs")
     annotate(GPUModelRunner, "_update_states", "worker.update_states")
+    annotate(GPUModelRunner, "_build_attention_metadata", "worker.attention_metadata")
     engine = llm.llm_engine
     original_step = engine.step
     trace = output.with_suffix(".trace.json")
@@ -466,11 +693,10 @@ def profile_generation(llm, generate, output: Path) -> dict:
         engine.step = original_step
         for owner, name, original in reversed(patches):
             setattr(owner, name, original)
-        for module, key, hook in capture_hooks:
-            module._forward_pre_hooks[key] = hook
+        for module, original in capture_hooks:
+            module.ngc_query_capture = original
     assert rows and trace.exists(), "Profiler did not capture the decode window"
-    if capture_hooks:
-        assert any(row["name"] == "NGC.query_capture" for row in rows)
+    timeline = summarize_profile_trace(trace)
     with trace.open("rb") as source, gzip.open(str(trace) + ".gz", "wb") as target:
         shutil.copyfileobj(source, target)
     trace.unlink()
@@ -480,8 +706,11 @@ def profile_generation(llm, generate, output: Path) -> dict:
         "active_steps": 144,
         "trace": trace.name + ".gz",
         "events": rows,
+        "timeline": timeline,
         "note": "Inclusive nested CPU/device totals overlap; do not add them. "
-        "Profile instrumentation is excluded from wall-clock samples.",
+        "Profile instrumentation is excluded from wall-clock samples. "
+        "Query-capture Python annotations are absent during CUDA graph replay; "
+        "replayed kernels are included in the GPU timeline.",
     }
 
 
@@ -553,11 +782,12 @@ def sweep(
     result_dir: Path,
     *,
     profiling: bool = False,
-    compare_capture: bool = False,
+    scheduler_profiling: bool = False,
     cases: list[str] | None = None,
     output_tokens: int = 2048,
     warmup_tokens: int = 2048,
     step_trace: bool = False,
+    num_seqs: int = 1,
 ) -> None:
     if cases is None:
         cases = (
@@ -565,30 +795,43 @@ def sweep(
             if profiling
             else ["full", "0", "0.10", "0.25", "0.50", "0.75"]
         )
-    assert "full" in cases, "Speedups are relative to full attention"
-    if compare_capture:
-        cases = [
-            "full",
-            "continuous-0",
-            "windowed-0",
-            "continuous-0.25",
-            "windowed-0.25",
-        ]
+    baseline_case = next(
+        (
+            case
+            for case in (
+                "before-0-graph",
+                "upstream-graph",
+                "full-graph",
+                "full",
+                "upstream",
+            )
+            if case in cases
+        ),
+        "full",
+    )
+    assert baseline_case in cases, "Speedups need a full or upstream baseline"
     order = cases.copy()
     random.Random(0).shuffle(order)
     reports = {}
     upstream_root = os.environ.get("NGC_UPSTREAM_ROOT")
-    if "upstream" in cases and upstream_root is None:
+    before_root = os.environ.get("NGC_BEFORE_ROOT")
+    if any(case.startswith("upstream") for case in cases) and not upstream_root:
         raise RuntimeError("The upstream case needs NGC_UPSTREAM_ROOT")
+    if any(case.startswith("before-") for case in cases) and not before_root:
+        raise RuntimeError("The before case needs NGC_BEFORE_ROOT")
     for case in order:
         output = result_dir / f"speed-{case}.json"
         script = __file__
         env = None
-        if case == "upstream":
+        if case.startswith("upstream"):
             # The script's own directory precedes PYTHONPATH on sys.path.
             assert upstream_root is not None
             script = str(Path(upstream_root) / Path(__file__).name)
             env = dict(os.environ, PYTHONPATH=upstream_root)
+        elif case.startswith("before-"):
+            assert before_root is not None
+            script = str(Path(before_root) / Path(__file__).name)
+            env = dict(os.environ, PYTHONPATH=before_root)
         subprocess.run(
             [
                 sys.executable,
@@ -603,21 +846,26 @@ def sweep(
                 str(output_tokens),
                 "--warmup-tokens",
                 str(warmup_tokens),
+                "--num-seqs",
+                str(num_seqs),
             ]
             + (["--profile"] if profiling else [])
+            + (["--scheduler-profile"] if scheduler_profiling else [])
             + (["--step-trace"] if step_trace else []),
             check=True,
             env=env,
         )
         reports[case] = json.loads(output.read_text())
-        expected_root = upstream_root if case == "upstream" else "/opt/vllm"
+        expected_root = upstream_root if case.startswith("upstream") else "/opt/vllm"
+        if case.startswith("before-"):
+            expected_root = before_root
         if expected_root is not None:
             assert reports[case]["vllm_source"].startswith(f"{expected_root}/"), (
                 case,
                 reports[case]["vllm_source"],
             )
         print(f"NGC_CHECKPOINT {case} {result_dir}", flush=True)
-    baseline = reports["full"]
+    baseline = reports[baseline_case]
     rows = []
     for case in cases:
         report = reports[case]
@@ -631,32 +879,30 @@ def sweep(
                 "min_seconds": min(report["seconds"]),
                 "max_seconds": max(report["seconds"]),
                 "tokens_per_second": report["tokens_per_second"],
-                "speedup_vs_full": baseline["median_seconds"]
+                f"speedup_vs_{baseline_case}": baseline["median_seconds"]
                 / report["median_seconds"],
+                **(
+                    {
+                        "speedup_vs_upstream-graph": reports["upstream-graph"][
+                            "median_seconds"
+                        ]
+                        / report["median_seconds"]
+                    }
+                    if "upstream-graph" in reports
+                    else {}
+                ),
             }
         )
     summary = {"order": order, "results": rows, "cases": reports}
+    if "before-0-graph" in reports and "0-graph" in reports:
+        summary["before_after_output_hashes_match"] = (
+            reports["before-0-graph"]["output_token_hashes"]
+            == reports["0-graph"]["output_token_hashes"]
+        )
+        assert summary["before_after_output_hashes_match"]
     if step_trace:
         summary["step_trace"] = compare_steps(reports, cases, result_dir)
         print(json.dumps(summary["step_trace"], indent=2), flush=True)
-    if compare_capture:
-        comparisons = []
-        for rate in ("0", "0.25"):
-            old = reports[f"continuous-{rate}"]
-            new = reports[f"windowed-{rate}"]
-            comparisons.append(
-                {
-                    "eviction_rate": float(rate),
-                    "continuous_seconds": old["median_seconds"],
-                    "windowed_seconds": new["median_seconds"],
-                    "speedup": old["median_seconds"] / new["median_seconds"],
-                    "latency_reduction_percent": 100
-                    * (1 - new["median_seconds"] / old["median_seconds"]),
-                    "same_output_tokens": old["output_token_hashes"]
-                    == new["output_token_hashes"],
-                }
-            )
-        summary["capture_comparison"] = comparisons
     (result_dir / "speed.json").write_text(json.dumps(summary, indent=2))
     with (result_dir / "speed.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
@@ -671,24 +917,26 @@ if __name__ == "__main__":
     parser.add_argument("--result-dir", type=Path, required=True)
     parser.add_argument("--case")
     parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--compare-capture", action="store_true")
+    parser.add_argument("--scheduler-profile", action="store_true")
     parser.add_argument("--cases", nargs="+")
     parser.add_argument("--output-tokens", type=int, default=2048)
     parser.add_argument("--warmup-tokens", type=int, default=2048)
     parser.add_argument("--step-trace", action="store_true")
+    parser.add_argument("--num-seqs", type=int, default=1)
     args = parser.parse_args()
-    if args.profile and args.output_tokens != 2048:
+    if (args.profile or args.scheduler_profile) and args.output_tokens != 2048:
         parser.error("The profile window assumes 2048 output tokens")
     if args.case is None:
         sweep(
             args.model,
             args.result_dir,
             profiling=args.profile,
-            compare_capture=args.compare_capture,
+            scheduler_profiling=args.scheduler_profile,
             cases=args.cases,
             output_tokens=args.output_tokens,
             warmup_tokens=args.warmup_tokens,
             step_trace=args.step_trace,
+            num_seqs=args.num_seqs,
         )
     else:
         run_case(
@@ -696,7 +944,9 @@ if __name__ == "__main__":
             args.case,
             args.result_dir / f"speed-{args.case}.json",
             profiling=args.profile,
+            scheduler_profiling=args.scheduler_profile,
             output_tokens=args.output_tokens,
             warmup_tokens=args.warmup_tokens,
             step_trace=args.step_trace,
+            num_seqs=args.num_seqs,
         )

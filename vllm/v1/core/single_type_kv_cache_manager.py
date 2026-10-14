@@ -729,14 +729,35 @@ class NGCEvictionManager(SingleTypeKVCacheManager):
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
-        layout = self.layouts.setdefault(request_id, NGCCacheLayout())
+        layout = self.layouts.get(request_id)
+        if layout is None:
+            layout = self.layouts[request_id] = NGCCacheLayout()
+        elif num_tokens <= (
+            len(self.req_to_blocks[request_id]) * self.block_size
+            + layout.evicted_tokens
+        ):
+            return []
         blocks = super().allocate_new_blocks(
             request_id,
             num_tokens - layout.evicted_tokens,
             num_tokens_main_model - layout.evicted_tokens,
         )
-        layout.extend(len(blocks), self.block_size)
+        if blocks:
+            layout.extend(len(blocks), self.block_size)
         return blocks
+
+    def append_allocated_blocks(
+        self, request_id: str, blocks: list[KVCacheBlock]
+    ) -> None:
+        """Attach blocks reserved together by the NGC coordinator."""
+        layout = self.layouts.get(request_id)
+        if layout is None:
+            layout = self.layouts[request_id] = NGCCacheLayout()
+        self.req_to_blocks[request_id].extend(blocks)
+        if blocks:
+            layout.extend(len(blocks), self.block_size)
+            if self._record_new_block_ids:
+                self.new_block_ids.extend(block.block_id for block in blocks)
 
     def get_cache_update(self, request_id: str) -> NGCCacheUpdate:
         layout = self.layouts[request_id]
@@ -764,7 +785,10 @@ class NGCEvictionManager(SingleTypeKVCacheManager):
             or proposal.page_size != self.block_size
             or proposal.retained_tokens != retained
             or len(blocks) != num_pages
-            or tuple(b.block_id for b in blocks) != proposal.block_ids
+            or (
+                proposal.block_ids is not None
+                and tuple(b.block_id for b in blocks) != proposal.block_ids
+            )
             or len(victims) != len(proposal.victim_indices)
             or any(i < 0 or i >= num_pages - 1 for i in victims)
             or len(victims)
@@ -779,6 +803,8 @@ class NGCEvictionManager(SingleTypeKVCacheManager):
             b.is_null or b.ref_cnt != 1 for b in removed
         ):
             return False
+        if not victims:
+            return True
         self.req_to_blocks[request_id] = [
             block for i, block in enumerate(blocks) if i not in victims
         ]

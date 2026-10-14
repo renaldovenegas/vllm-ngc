@@ -267,6 +267,28 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
         return attn_metadata
 
+    def reuse_ngc_metadata(
+        self,
+        metadata: TritonAttentionMetadata,
+        common: CommonAttentionMetadata,
+    ) -> TritonAttentionMetadata:
+        """Reuse shared batch fields while retaining this layer's cache and scratch."""
+        assert not metadata.use_cascade
+        assert metadata.mm_prefix_range is None and metadata.rswa_window is None
+        # Avoid copy.copy's reconstruction protocol in this per-layer hot path.
+        result = object.__new__(TritonAttentionMetadata)
+        result.__dict__ = metadata.__dict__.copy()
+        result.seq_lens = common.seq_lens
+        result.max_seq_len = common.max_seq_len
+        result.block_table = common.block_table_tensor
+        result.slot_mapping = common.slot_mapping
+        result.seq_threshold_3D = self.seq_threshold_3D
+        result.num_par_softmax_segments = self.num_par_softmax_segments
+        result.softmax_segm_output = self.softmax_segm_output
+        result.softmax_segm_max = self.softmax_segm_max
+        result.softmax_segm_expsum = self.softmax_segm_expsum
+        return result
+
     def update_draft_decode_metadata(self, _metadata: TritonAttentionMetadata) -> None:
         pass
 

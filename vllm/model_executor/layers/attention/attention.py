@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -277,6 +278,8 @@ class Attention(nn.Module, AttentionLayerBase):
             )
         self.ngc_eviction_config = ngc_eviction_config
         self.ngc_softmax_scale = scale
+        # Set by the model runner; records queries with persistent buffers only.
+        self.ngc_query_capture: Callable[[torch.Tensor], None] | None = None
 
         vllm_config = get_current_vllm_config()
         if cache_config is not None:
@@ -786,6 +789,9 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+    ngc_query_capture = getattr(self, "ngc_query_capture", None)
+    if ngc_query_capture is not None:
+        ngc_query_capture(query)
 
     self.impl.forward(
         self,

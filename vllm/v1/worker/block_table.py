@@ -68,6 +68,7 @@ class BlockTable:
         cp_kv_cache_interleave_size: int,
         slot_mapping_mode: SlotMappingMode = SlotMappingMode.TOKEN_TO_KV_SLOT,
         block_table: CpuGpuBuffer | None = None,
+        dirty_rows: np.ndarray | None = None,
     ):
         """
         Args:
@@ -84,6 +85,7 @@ class BlockTable:
                 cache slots. Mamba-like state caches do not use token slot
                 mappings and should use SlotMappingMode.NONE.
             block_table: Optional view into shared transfer storage.
+            dirty_rows: Optional shared mask for pending CPU table updates.
         """
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -122,6 +124,7 @@ class BlockTable:
             )
         )
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
+        self._dirty_rows = dirty_rows
 
         self.slot_mapping = self._make_buffer(
             self.max_num_batched_tokens, dtype=torch.int64
@@ -178,18 +181,23 @@ class BlockTable:
         start = self.num_blocks_per_row[row_idx]
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
+        self.mark_dirty(row_idx, row_idx + 1)
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
+        self.mark_dirty(row_idx, row_idx + 1)
         self.num_blocks_per_row[row_idx] = 0
         self.append_row(block_ids, row_idx)
 
     def clear_row(self, row_idx: int) -> None:
+        self.mark_dirty(row_idx, row_idx + 1)
         num_blocks = self.num_blocks_per_row[row_idx]
         if num_blocks > 0:
             self.block_table.np[row_idx, :num_blocks] = 0
         self.num_blocks_per_row[row_idx] = 0
 
     def move_row(self, src: int, tgt: int) -> None:
+        self.mark_dirty(src, src + 1)
+        self.mark_dirty(tgt, tgt + 1)
         num_blocks = self.num_blocks_per_row[src]
         block_table_np = self.block_table.np
         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
@@ -201,9 +209,15 @@ class BlockTable:
         self.num_blocks_per_row[src] = 0
 
     def swap_row(self, src: int, tgt: int) -> None:
+        self.mark_dirty(src, src + 1)
+        self.mark_dirty(tgt, tgt + 1)
         src_tgt, tgt_src = [src, tgt], [tgt, src]
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
+
+    def mark_dirty(self, start: int, end: int) -> None:
+        if self._dirty_rows is not None:
+            self._dirty_rows[start:end] = True
 
     def compute_slot_mapping(
         self,
@@ -339,12 +353,13 @@ class MultiGroupBlockTable:
         ]
 
         self._batched_block_table: CpuGpuBuffer | None = None
+        self._dirty_rows = np.zeros(max_num_reqs, dtype=np.bool_)
         shared_tables: dict[int, CpuGpuBuffer] = {}
         if len(set(batched_group_ids)) != len(batched_group_ids) or any(
             i < 0 or i >= len(block_sizes) for i in batched_group_ids
         ):
             raise ValueError("Batched group IDs must be unique valid group indices")
-        if len(batched_group_ids) > 1:
+        if batched_group_ids:
             # Pack groups within each request row so the active rows transfer
             # contiguously. Each layer still has its own table and row counts.
             widths = {
@@ -373,6 +388,8 @@ class MultiGroupBlockTable:
                 shared_tables[i] = view
                 offset += width
         self._batched_group_ids = frozenset(shared_tables)
+        # Packed column order of NGC offsets, retained lengths, and slot rows.
+        self.batched_group_ids = tuple(shared_tables)
 
         self.block_tables = [
             BlockTable(
@@ -386,6 +403,7 @@ class MultiGroupBlockTable:
                 cp_kv_cache_interleave_size,
                 slot_mapping_mode=slot_mapping_mode,
                 block_table=shared_tables.get(i),
+                dirty_rows=self._dirty_rows if i in shared_tables else None,
             )
             for i, (
                 block_size,
@@ -396,6 +414,67 @@ class MultiGroupBlockTable:
                 zip(block_sizes, kernel_block_sizes, max_num_blocks, slot_mapping_modes)
             )
         ]
+        self.ngc_retained: CpuGpuBuffer | None = None
+        if shared_tables:
+            num_groups = len(shared_tables)
+            self._ngc_slots = CpuGpuBuffer(
+                num_groups,
+                max_num_batched_tokens,
+                dtype=torch.int64,
+                device=device,
+                pin_memory=pin_memory,
+            )
+            self.ngc_retained = CpuGpuBuffer(
+                num_groups,
+                max_num_reqs,
+                dtype=torch.int32,
+                device=device,
+                pin_memory=pin_memory,
+            )
+            geometry = []
+            offset = 0
+            for column, gid in enumerate(shared_tables):
+                table = self.block_tables[gid]
+                geometry.append((offset, table.block_size))
+                offset += table.max_num_blocks_per_req
+                view = copy(self._ngc_slots)
+                view.cpu = self._ngc_slots.cpu[column]
+                view.gpu = self._ngc_slots.gpu[column]
+                view.np = view.cpu.numpy()
+                table.slot_mapping = view
+            self._ngc_geometry = torch.tensor(
+                geometry, dtype=torch.int64, device=device
+            )
+            self._ngc_compile_args = dict(
+                max_num_reqs=max_num_reqs,
+                max_num_tokens=max_num_batched_tokens,
+                num_groups=num_groups,
+                table_stride=offset,
+            )
+            _COMPUTE_NGC_METADATA_KERNEL.register_warmup(**self._ngc_compile_args)
+
+    def compute_ngc_metadata(
+        self,
+        num_reqs: int,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        evicted: torch.Tensor,
+    ) -> None:
+        assert self._batched_block_table is not None and self.ngc_retained is not None
+        _COMPUTE_NGC_METADATA_KERNEL(
+            num_reqs,
+            positions.numel(),
+            query_start_loc,
+            positions,
+            seq_lens,
+            evicted,
+            self._batched_block_table.gpu,
+            self._ngc_geometry,
+            self._ngc_slots.gpu,
+            self.ngc_retained.gpu,
+            **self._ngc_compile_args,
+        )
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
@@ -427,8 +506,9 @@ class MultiGroupBlockTable:
             block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
 
     def commit_block_table(self, num_reqs: int) -> None:
-        if self._batched_block_table is not None:
+        if self._batched_block_table is not None and self._dirty_rows[:num_reqs].any():
             self._batched_block_table.copy_to_gpu(num_reqs)
+            self._dirty_rows[:num_reqs] = False
         for i, block_table in enumerate(self.block_tables):
             if i not in self._batched_group_ids:
                 block_table.commit_block_table(num_reqs)
@@ -575,3 +655,107 @@ class ComputeSlotMappingKernel(VllmJitKernel["ComputeSlotMappingKernel.CompileKe
 
 
 _COMPUTE_SLOT_MAPPING_KERNEL = ComputeSlotMappingKernel()
+
+
+class ComputeNGCMetadataKernel(VllmJitKernel["ComputeNGCMetadataKernel.CompileKey"]):
+    @dataclass(frozen=True)
+    class CompileKey:
+        max_num_reqs: int
+        max_num_tokens: int
+        num_groups: int
+        table_stride: int
+
+    @staticmethod
+    @triton.jit(do_not_specialize=["num_reqs", "num_tokens"])
+    def kernel(
+        num_reqs,
+        num_tokens,
+        query_start,
+        positions,
+        seq_lens,
+        evicted,
+        tables,
+        geometry,
+        slots,
+        retained,
+        max_num_reqs: tl.constexpr,
+        max_num_tokens: tl.constexpr,
+        num_groups: tl.constexpr,
+        table_stride: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        req = tl.program_id(0).to(tl.int64)
+        group = tl.program_id(1).to(tl.int64)
+        lanes = tl.arange(0, BLOCK)
+        if req == num_reqs:
+            for start in range(num_tokens, max_num_tokens, BLOCK):
+                idx = start + lanes
+                tl.store(
+                    slots + group * max_num_tokens + idx, -1, mask=idx < max_num_tokens
+                )
+            for start in range(num_reqs, max_num_reqs, BLOCK):
+                idx = start + lanes
+                tl.store(
+                    retained + group * max_num_reqs + idx, 0, mask=idx < max_num_reqs
+                )
+        else:
+            removed = tl.load(evicted + req * num_groups + group)
+            length = tl.load(seq_lens + req) - removed
+            tl.store(retained + group * max_num_reqs + req, length)
+            column = tl.load(geometry + group * 2)
+            page_size = tl.load(geometry + group * 2 + 1)
+            begin = tl.load(query_start + req)
+            end = tl.load(query_start + req + 1)
+            for start in range(begin, end, BLOCK):
+                idx = start + lanes
+                pos = tl.load(positions + idx, mask=idx < end, other=0) - removed
+                block = tl.load(
+                    tables + req * table_stride + column + pos // page_size,
+                    mask=idx < end,
+                    other=0,
+                ).to(tl.int64)
+                tl.store(
+                    slots + group * max_num_tokens + idx,
+                    block * page_size + pos % page_size,
+                    mask=idx < end,
+                )
+
+    def dispatch(self, **kwargs: int) -> CompileKey:  # type: ignore[override]
+        return self.CompileKey(**kwargs)
+
+    def get_warmup_keys(self, **kwargs: int) -> list[CompileKey]:
+        return [self.dispatch(**kwargs)]
+
+    def compile(self, compile_key: CompileKey) -> None:
+        from dataclasses import asdict
+
+        i32 = TritonWarmupTensor(torch.int32)
+        i64 = TritonWarmupTensor(torch.int64)
+        warmup = getattr(self.kernel, "warmup", None)
+        assert warmup is not None
+        warmup(
+            2,
+            2,
+            i32,
+            i64,
+            i32,
+            i32,
+            i32,
+            i64,
+            i64,
+            i32,
+            **asdict(compile_key),
+            BLOCK=256,
+            grid=(3, compile_key.num_groups),
+        )
+
+    def __call__(self, num_reqs: int, *args: Any, **kwargs: int) -> None:
+        self.kernel[(num_reqs + 1, kwargs["num_groups"])](
+            num_reqs,
+            *args,
+            **kwargs,
+            BLOCK=256,
+        )
+
+
+_COMPUTE_NGC_METADATA_KERNEL = ComputeNGCMetadataKernel()

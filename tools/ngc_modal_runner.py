@@ -47,6 +47,7 @@ def smoke(
     story: bool = False,
     ngc_enabled: bool = True,
     equivalence: bool = False,
+    graphs: bool = False,
 ) -> None:
     from vllm import LLM, SamplingParams
     from vllm.config.cache import NGCEvictionConfig
@@ -116,7 +117,7 @@ def smoke(
     try:
         llm = LLM(
             model=model,
-            enforce_eager=True,
+            enforce_eager=not graphs,
             async_scheduling=False,
             distributed_executor_backend="uni",
             tensor_parallel_size=1,
@@ -206,6 +207,7 @@ def smoke(
         report = {
             "model": model,
             "attention_mode": "ngc_all_layers" if ngc_enabled else "full",
+            "enforce_eager": not graphs,
             "chat_template_applied": story or equivalence,
             "zero_decisions": zero_decisions,
             "layers": configured_layers,
@@ -249,14 +251,16 @@ def smoke(
         NGCScoringBuffers.score_if_due = original_score
 
 
-def zero_equivalence(model: str, result_dir: Path) -> None:
+def zero_equivalence(model: str, result_dir: Path, *, graphs: bool = False) -> None:
     """Compare fresh engines on the same GPU across three scoring boundaries.
 
     Exact greedy tokens and selected-token logprobs test the model's decode
     behavior with active per-layer bookkeeping, without changing its history.
+    Both engines use the same execution mode, eager or CUDA graphs.
     """
     reports = []
-    for mode in ("zero-full", "zero-ngc"):
+    suffix = "-graph" if graphs else ""
+    for mode in (f"zero-full{suffix}", f"zero-ngc{suffix}"):
         target = result_dir / mode
         target.mkdir()
         subprocess.run(
@@ -310,34 +314,152 @@ def main() -> None:
         choices=[
             "check",
             "kernels",
+            "metadata",
             "smoke",
+            "smoke-graph",
             "story-ngc",
             "story-full",
             "zero-equivalence",
+            "zero-equivalence-graph",
             "zero-full",
             "zero-ngc",
+            "zero-full-graph",
+            "zero-ngc-graph",
             "speed",
             "profile",
-            "capture-speed",
             "speed-long",
             "speed-upstream",
+            "scheduler-ab",
+            "speed-eviction",
+            "validate-inputs",
             "step-trace",
+            "speed-batch",
+            "speed-batch-graph",
+            "profile-batch-graph",
+            "profile-scheduler",
+            "bookkeeping-ab",
+            "graph-baseline",
         ],
         required=True,
     )
     parser.add_argument("--selector", default="ngc")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--result-dir", type=Path, required=True)
     args = parser.parse_args()
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    if args.job != "speed-eviction" and args.batch_size != 50:
+        parser.error("--batch-size currently applies only to speed-eviction")
     check_environment()
+    if args.job == "validate-inputs":
+        for job in ("zero-equivalence", "zero-equivalence-graph", "smoke-graph"):
+            target = args.result_dir / job
+            target.mkdir()
+            subprocess.run(
+                [
+                    sys.executable,
+                    __file__,
+                    "--job",
+                    job,
+                    "--model",
+                    args.model,
+                    "--result-dir",
+                    str(target),
+                ],
+                check=True,
+            )
+        return
+    if args.job == "graph-baseline":
+        # Upstream eager vs CUDA graphs at batch 1 and 50 on one GPU.
+        for num_seqs in (1, 50):
+            target = args.result_dir / f"batch-{num_seqs}"
+            target.mkdir()
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("ngc_modal_benchmark.py")),
+                    "--model",
+                    args.model,
+                    "--result-dir",
+                    str(target),
+                    "--cases",
+                    "upstream",
+                    "upstream-graph",
+                    "--num-seqs",
+                    str(num_seqs),
+                    "--warmup-tokens",
+                    "384",
+                ],
+                check=True,
+            )
+            print(f"NGC_CHECKPOINT batch-{num_seqs} {target}", flush=True)
+        return
     if args.job in {
         "speed",
         "profile",
-        "capture-speed",
         "speed-long",
         "speed-upstream",
+        "scheduler-ab",
+        "speed-eviction",
         "step-trace",
+        "speed-batch",
+        "speed-batch-graph",
+        "profile-batch-graph",
+        "profile-scheduler",
+        "bookkeeping-ab",
     }:
+        bookkeeping_args = [
+            "--scheduler-profile",
+            "--cases",
+            "before-0-graph",
+            "0-graph",
+            "--num-seqs",
+            "50",
+            "--warmup-tokens",
+            "384",
+        ]
+        scheduler_profile_args = [
+            "--scheduler-profile",
+            "--cases",
+            "upstream-graph",
+            "0-graph",
+            "--num-seqs",
+            "50",
+            "--warmup-tokens",
+            "384",
+        ]
+        profile_graph_args = [
+            "--profile",
+            "--cases",
+            "upstream-graph",
+            "full-graph",
+            "0-graph",
+            "--num-seqs",
+            "50",
+            "--warmup-tokens",
+            "384",
+        ]
+        batch_graph_args = [
+            "--cases",
+            "upstream-graph",
+            "0-graph",
+            "0.50-graph",
+            "--num-seqs",
+            "50",
+            "--warmup-tokens",
+            "384",
+        ]
+        batch_args = [
+            "--cases",
+            "upstream",
+            "0",
+            "0.50",
+            "--num-seqs",
+            "50",
+            "--warmup-tokens",
+            "384",
+        ]
         trace_args = [
             "--cases",
             "full",
@@ -378,14 +500,49 @@ def main() -> None:
                 str(args.result_dir),
             ]
             + (["--profile"] if args.job == "profile" else [])
-            + (["--compare-capture"] if args.job == "capture-speed" else [])
             + (long_args if args.job == "speed-long" else [])
             + (upstream_args if args.job == "speed-upstream" else [])
-            + (trace_args if args.job == "step-trace" else []),
+            + (trace_args if args.job == "step-trace" else [])
+            + (
+                [
+                    "--cases",
+                    "before-0-graph",
+                    "0-graph",
+                    "upstream-graph",
+                    "--num-seqs",
+                    "50",
+                    "--warmup-tokens",
+                    "384",
+                ]
+                if args.job == "scheduler-ab"
+                else []
+            )
+            + (batch_args if args.job == "speed-batch" else [])
+            + (batch_graph_args if args.job == "speed-batch-graph" else [])
+            + (profile_graph_args if args.job == "profile-batch-graph" else [])
+            + (scheduler_profile_args if args.job == "profile-scheduler" else [])
+            + (bookkeeping_args if args.job == "bookkeeping-ab" else [])
+            + (
+                [
+                    "--cases",
+                    "upstream-graph",
+                    "0-graph",
+                    "0.5-graph",
+                    "0.75-graph",
+                    "--num-seqs",
+                    str(args.batch_size),
+                    "--warmup-tokens",
+                    "384",
+                ]
+                if args.job == "speed-eviction"
+                else []
+            ),
             check=True,
         )
         return
-    if args.job == "kernels":
+    if args.job == "metadata":
+        subprocess.run([sys.executable, "ngc_metadata_benchmark.py"], check=True)
+    elif args.job == "kernels":
         subprocess.run(
             [
                 sys.executable,
@@ -396,6 +553,7 @@ def main() -> None:
                 "addopts=",
                 "tests/kernels/attention/test_triton_unified_attention.py",
                 "tests/v1/worker/test_gpu_input_batch.py",
+                "tests/v1/worker/test_ngc_scoring.py",
                 "-k",
                 args.selector,
                 "-v",
@@ -404,20 +562,23 @@ def main() -> None:
             ],
             check=True,
         )
-    elif args.job == "smoke":
-        smoke(args.model, args.result_dir)
+    elif args.job in {"smoke", "smoke-graph"}:
+        smoke(args.model, args.result_dir, graphs=args.job == "smoke-graph")
     elif args.job in {"story-ngc", "story-full"}:
         smoke(
             args.model, args.result_dir, story=True, ngc_enabled=args.job == "story-ngc"
         )
-    elif args.job == "zero-equivalence":
-        zero_equivalence(args.model, args.result_dir)
-    elif args.job in {"zero-full", "zero-ngc"}:
+    elif args.job in {"zero-equivalence", "zero-equivalence-graph"}:
+        zero_equivalence(
+            args.model, args.result_dir, graphs=args.job == "zero-equivalence-graph"
+        )
+    elif args.job in {"zero-full", "zero-ngc", "zero-full-graph", "zero-ngc-graph"}:
         smoke(
             args.model,
             args.result_dir,
-            ngc_enabled=args.job == "zero-ngc",
+            ngc_enabled=args.job.startswith("zero-ngc"),
             equivalence=True,
+            graphs=args.job.endswith("-graph"),
         )
 
 

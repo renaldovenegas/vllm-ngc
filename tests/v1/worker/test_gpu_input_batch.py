@@ -49,11 +49,11 @@ def test_batched_ngc_tables_preserve_independent_updates(device, monkeypatch):
 
     monkeypatch.setattr(CpuGpuBuffer, "copy_to_gpu", track_copy)
 
-    def commit_and_compare(num_reqs):
+    def commit_and_compare(num_reqs, expected_copies=2):
         separate.commit_block_table(num_reqs)
         copies.clear()
         packed.commit_block_table(num_reqs)
-        assert len(copies) == 2, "One NGC transfer plus the ordinary group's transfer"
+        assert len(copies) == expected_copies
         for expected, actual in zip(separate.block_tables, packed.block_tables):
             torch.testing.assert_close(actual.block_table.gpu, expected.block_table.gpu)
             np.testing.assert_array_equal(
@@ -64,6 +64,7 @@ def test_batched_ngc_tables_preserve_independent_updates(device, monkeypatch):
         tables.add_row(([1, 2, 3], [10, 11], [20, 21]), 0)
         tables.add_row(([4, 5], [12, 13], [22, 23]), 1)
     commit_and_compare(2)
+    commit_and_compare(2, expected_copies=1)
 
     if device != "cpu":
         starts = torch.tensor([0, 2, 3], dtype=torch.int32, device=device)
@@ -74,6 +75,23 @@ def test_batched_ngc_tables_preserve_independent_updates(device, monkeypatch):
             torch.testing.assert_close(
                 actual.slot_mapping.gpu[:3], expected.slot_mapping.gpu[:3]
             )
+        positions = torch.tensor([16, 33, 63], dtype=torch.int64, device=device)
+        lengths = torch.tensor([48, 64], dtype=torch.int32, device=device)
+        removed = torch.tensor([[16, 0], [0, 32]], dtype=torch.int32, device=device)
+        req_indices = torch.tensor([0, 0, 1], device=device)
+        for offsets in (removed, torch.zeros_like(removed)):
+            packed.compute_ngc_metadata(2, starts, positions, lengths, offsets)
+            for column, gid in enumerate((0, 2)):
+                separate[gid].compute_slot_mapping(
+                    2, starts, positions - offsets[req_indices, column]
+                )
+                torch.testing.assert_close(
+                    packed[gid].slot_mapping.gpu, separate[gid].slot_mapping.gpu
+                )
+                torch.testing.assert_close(
+                    packed.ngc_retained.gpu[column, :2], lengths - offsets[:, column]
+                )
+                assert not packed.ngc_retained.gpu[column, 2:].any()
 
     for tables in (separate, packed):
         tables[0].add_row([1, 3], 0)  # Evict only from the first NGC layer.
@@ -87,6 +105,11 @@ def test_batched_ngc_tables_preserve_independent_updates(device, monkeypatch):
     for tables in (separate, packed):
         tables.add_row(([7], [14], [25]), 0)
     commit_and_compare(1)
+    # An update outside the active batch must survive until that row is scheduled.
+    for tables in (separate, packed):
+        tables[2].add_row([26], 2)
+    commit_and_compare(1, expected_copies=1)
+    commit_and_compare(3)
 
 
 def _compare_objs(obj1, obj2, skip: Sequence = ("logitsprocs", "batch_update_builder")):

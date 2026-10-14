@@ -35,7 +35,17 @@ source uploads.
 # Full attention vs zero-rate NGC, fresh engines on the same GPU.
 NGC_MODAL_GPU=A100 .venv/bin/modal run --detach tools/ngc_modal.py \
   --job zero-equivalence --model Qwen/Qwen2.5-7B-Instruct
+
+# The same checks with torch.compile and CUDA graphs instead of eager mode.
+.venv/bin/modal run tools/ngc_modal.py --job smoke-graph
+NGC_MODAL_GPU=A100 .venv/bin/modal run --detach tools/ngc_modal.py \
+  --job zero-equivalence-graph --model Qwen/Qwen2.5-7B-Instruct
 ```
+
+NGC records each layer's post-RoPE queries inside the attention op by copying
+rows between persistent buffers, so it runs in eager mode and under CUDA graphs.
+The `-graph` jobs use vLLM's default compilation and CUDA graph settings, and
+zero-equivalence compares full attention and NGC in the same execution mode.
 
 The smoke test defaults to the public `Qwen/Qwen3-0.6B` model. It runs the V1
 model runner in-process with synchronous eager execution, Triton attention,
@@ -78,6 +88,11 @@ Each completed configuration commits its report to the volume. With `--detach
 --submit-only`, the local launcher exits after submitting the remote call;
 retrieve the reports from the volume when the job finishes.
 
+Configuration names ending in `-graph` (for example `0.50-graph` or
+`upstream-graph`) run with torch.compile and CUDA graphs. For batch-50
+throughput with CUDA graphs for upstream, rate 0, and rate 0.50, use
+`--job speed-batch-graph`; `--job speed-batch` is the eager equivalent.
+
 Use `--job profile` with the same command to investigate overhead at full
 attention and NGC rates 0 and 0.25. This enables verbose JIT logging, records
 post-warmup compilation events separately for timed and profiled generations,
@@ -88,6 +103,33 @@ and worker input/state updates. Inclusive nested timings overlap and must not
 be added. Event summaries are in each `speed-<case>.json`; compressed Chrome
 traces (`*.trace.json.gz`) stay in the Modal volume and must be downloaded
 separately. The original wall-clock samples contain no profiler annotations.
+
+Use `--job profile-batch-graph --model Qwen/Qwen2.5-7B-Instruct` on an A100
+to compare upstream, this fork's full attention, and zero-eviction NGC with
+CUDA graphs at batch 50. Each case has three uninstrumented timing runs and
+a separate CPU/CUDA trace. The `profile.timeline` report measures GPU busy
+time as an interval union and separates ordinary steps from scoring boundaries.
+Scheduler, metadata, and input preparation annotations are inclusive host wall
+spans (including waits), not CPU utilization. They overlap GPU execution;
+do not add them to GPU busy time. CUDA graph kernels appear in the GPU trace
+even though replay does not invoke the query-capture Python annotation.
+
+Use `--job profile-scheduler --model Qwen/Qwen2.5-7B-Instruct` on an A100
+for scheduler attribution at batch 50, comparing upstream and zero-eviction NGC.
+After the three ordinary timing runs, separate generations collect coarse method
+timings and a scheduler-only Python call profile over 144 late-decode steps.
+Reports include calling-thread CPU time, nested KV-manager/coordinator timings,
+function call counts, self/cumulative times, and callers. Steps consuming NGC
+proposals are separated from ordinary scheduling. Nested times overlap;
+the call profiler adds overhead and should not be used for absolute latency.
+
+For a paired bookkeeping comparison on one GPU allocation, set
+`NGC_MODAL_BEFORE_MANAGER` to a saved pre-change
+`single_type_kv_cache_manager.py` and run `--job bookkeeping-ab`. It compares
+`before-0-graph` with `0-graph` at batch 50 using three uninstrumented timing
+runs and the same scheduler profiles. Each case runs in a fresh process;
+the before checkout differs only in the supplied manager file. Reports record
+manager source hashes and whether generated-token hashes match across versions.
 
 For a longer-context comparison of full attention, rate 0, and rate 0.75:
 
@@ -104,6 +146,56 @@ contain `layers.<index>.`. Gated models require additional credential setup;
 local Hugging Face credentials are not uploaded.
 
 ## Results
+
+Use `--job validate-inputs` for eager and CUDA graph zero-eviction equivalence
+checks followed by a graph smoke test with real eviction. Each check's reports
+are downloaded into its own subdirectory.
+
+For non-NGC versus 0%, 50%, and 75% NGC eviction on one GPU allocation:
+
+```bash
+NGC_MODAL_GPU=A100 .venv/bin/modal run --detach tools/ngc_modal.py \
+  --job speed-eviction --model Qwen/Qwen2.5-7B-Instruct
+```
+
+This uses 50 requests, 2048 output tokens each, a 384-token warmup, and three
+unprofiled timed repetitions per case with unchanged CUDA graph settings.
+Reports include warmup eviction decisions and freed pages. Positive eviction
+rates can change generated tokens; only rate zero should match non-NGC.
+
+Set `--batch-size` to change both the number of requests and the engine's
+`max_num_seqs` for every case (default: 50). For example:
+
+```bash
+NGC_MODAL_GPU=A100 .venv/bin/modal run --detach tools/ngc_modal.py \
+  --job speed-eviction --model Qwen/Qwen2.5-7B-Instruct --batch-size 48
+```
+
+For this benchmark's default graph settings, try 48 for full decode graph
+coverage close to the previous batch of 50. Other default capture sizes include
+8, 16, 24, 32, 40, 56, and 64. Batch 50 falls back to piecewise graphs: the next
+capture size is 56, which exceeds its `max_num_seqs=50`. The batch-size option
+applies only to `speed-eviction`; the other jobs retain their existing settings.
+
+For a comparison of the batched scheduler changes with the previous NGC
+implementation and pristine pinned upstream, place the previous
+`kv_cache_coordinator.py`, `gpu_model_runner.py`, and `triton_attn.py` in one
+directory, then run:
+
+```bash
+NGC_MODAL_GPU=A100 \
+  NGC_MODAL_BEFORE_DIR=.ngc-modal-results/batched-management-before \
+  .venv/bin/modal run --detach tools/ngc_modal.py \
+  --job scheduler-ab --model Qwen/Qwen2.5-7B-Instruct
+```
+
+The three cases share one GPU allocation. Each uses 50 requests, a 384-token
+warmup, and three timed generations of 2048 tokens per request, with CUDA graphs
+enabled and NGC eviction rate zero. The previous implementation retains the
+current manager file; the new append helper is unused by the previous
+coordinator. Reports include GPU UUID, source file hashes, matching output
+hashes for previous/current NGC, and speedups against both baselines. The
+upstream baseline is the pinned binary base below, rather than latest upstream.
 
 Logs stream to your terminal. Reports are downloaded to
 `.ngc-modal-results/<run-id>/` even when a test process fails. Kernel jobs produce

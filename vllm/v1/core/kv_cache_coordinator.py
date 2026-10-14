@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    NGCEvictionManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -151,6 +152,14 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        self._ngc_managers = tuple(
+            m for m in self.single_type_managers if type(m) is NGCEvictionManager
+        )
+        self._all_ngc = bool(self._ngc_managers) and len(self._ngc_managers) == len(
+            self.single_type_managers
+        )
+        # Whole-page eviction preserves allocated capacity + evicted tokens.
+        self._ngc_capacity: dict[str, int] = {}
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -196,6 +205,12 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
+        if self._all_ngc:
+            assert not any(new_computed_blocks)
+            capacity = self._ngc_capacity.get(request_id)
+            if capacity is not None and num_tokens <= capacity:
+                return 0
+            return sum(self._ngc_allocation_sizes(request_id, num_tokens))
         num_blocks_to_allocate = 0
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
@@ -292,6 +307,26 @@ class KVCacheCoordinator(ABC):
         Returns:
             The new allocated blocks.
         """
+        if self._all_ngc:
+            capacity = self._ngc_capacity.get(request_id)
+            if capacity is not None and num_tokens <= capacity:
+                return tuple([] for _ in self._ngc_managers)
+            sizes = self._ngc_allocation_sizes(request_id, num_tokens)
+            blocks = self.block_pool.get_new_blocks(sum(sizes)) if any(sizes) else []
+            result: list[list[KVCacheBlock]] = []
+            offset = 0
+            for manager, size in zip(self._ngc_managers, sizes):
+                allocated = blocks[offset : offset + size]
+                offset += size
+                if size or request_id not in manager.layouts:
+                    manager.append_allocated_blocks(request_id, allocated)
+                result.append(allocated)
+            self._ngc_capacity[request_id] = min(
+                len(manager.req_to_blocks[request_id]) * manager.block_size
+                + manager.layouts[request_id].evicted_tokens
+                for manager in self._ngc_managers
+            )
+            return tuple(result)
         return tuple(
             manager.allocate_new_blocks(
                 request_id,
@@ -302,6 +337,17 @@ class KVCacheCoordinator(ABC):
             )
             for manager in self.single_type_managers
         )
+
+    def _ngc_allocation_sizes(self, request_id: str, num_tokens: int) -> list[int]:
+        sizes = []
+        for manager in self._ngc_managers:
+            layout = manager.layouts.get(request_id)
+            retained = num_tokens - (layout.evicted_tokens if layout else 0)
+            required = (retained + manager.block_size - 1) // manager.block_size
+            sizes.append(
+                max(required - len(manager.req_to_blocks.get(request_id, ())), 0)
+            )
+        return sizes
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
@@ -332,6 +378,7 @@ class KVCacheCoordinator(ABC):
         Args:
             request_id: The request ID.
         """
+        self._ngc_capacity.pop(request_id, None)
         for manager in self.single_type_managers:
             manager.free(request_id)
 
@@ -349,6 +396,7 @@ class KVCacheCoordinator(ABC):
         Returns:
             The request's blocks in allocation order.
         """
+        self._ngc_capacity.pop(request_id, None)
         blocks: list[KVCacheBlock] = []
         for manager in self.single_type_managers:
             blocks.extend(manager.pop_blocks_for_free(request_id))
@@ -389,6 +437,8 @@ class KVCacheCoordinator(ABC):
                 free gap blocks between the prefill tail and decode window; other
                 manager types ignore it.
         """
+        if self._all_ngc:
+            return
         for manager in self.single_type_managers:
             manager.remove_skipped_blocks(
                 request_id, processed_computed_tokens, num_prompt_tokens
