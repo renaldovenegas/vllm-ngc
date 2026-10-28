@@ -104,7 +104,7 @@ def ngc_scorer_kernel(
             k_addr,
             mask=mask[:, None] & (offs_d[None, :] < HEAD_DIM),
             other=0.0,
-        )
+        ).to(q_group.dtype)
 
         logits = (
             tl.dot(q_group, tl.trans(k_tile)) * softmax_scale
@@ -196,6 +196,7 @@ def ngc_page_scores(
         key_cache: Unquantized post-RoPE keys in logical [pages, kv_heads,
             page_size, head_dim] order. For the standard vLLM cache, pass
             ``kv_cache[..., :head_dim]``. Physical strides are preserved.
+            FP16/BF16 keys are cast to the query dtype inside the kernel.
         block_table: One contiguous int32/int64 request row of physical page
             IDs, in retained logical order. Referenced IDs must be valid and
             owned by this request; there must be no holes or null blocks in
@@ -228,8 +229,8 @@ def ngc_page_scores(
         raise ValueError("Queries, key cache, and block table must share a device")
     if query.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError("NGC scoring supports float16 and bfloat16 queries")
-    if key_cache.dtype != query.dtype:
-        raise TypeError("Key cache must have the same unquantized dtype as queries")
+    if key_cache.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("NGC scoring supports float16 and bfloat16 keys")
     if block_table.dtype not in (torch.int32, torch.int64):
         raise TypeError("Block table must contain int32 or int64 page IDs")
     if query.stride(-1) != 1 or key_cache.stride(-1) != 1:

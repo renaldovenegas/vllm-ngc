@@ -550,7 +550,7 @@ class NGCEvictionSpec(AttentionSpec):
     """
 
     cadence: int = 32
-    """Committed generated tokens per request between eviction events."""
+    """Computed tokens per request between eviction events, including prompt tokens."""
     eviction_rate: float = 0.1
     """Fraction of eligible retained pages to evict at each event."""
     min_retained_tokens: int = 1

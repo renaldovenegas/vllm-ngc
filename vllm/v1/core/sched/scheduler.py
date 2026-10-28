@@ -111,6 +111,15 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 "NGC eviction requires the V1 model runner without routed-expert output"
             )
+        self._ngc_cadences = tuple(
+            sorted(
+                {
+                    spec.cadence
+                    for group in self._ngc_groups.values()
+                    if isinstance(spec := group.kv_cache_spec, NGCEvictionSpec)
+                }
+            )
+        )
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
@@ -527,12 +536,16 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _cap_ngc_chunk(self, computed_tokens: int, num_new_tokens: int) -> int:
+        """Stop before computing any token beyond an NGC eviction boundary."""
+        for cadence in self._ngc_cadences:
+            num_new_tokens = min(num_new_tokens, cadence - computed_tokens % cadence)
+        return num_new_tokens
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         pending = self.ngc_eviction_inbox.pending
-        for proposal in list(pending.values()):
-            request = self.requests.get(proposal.request_id)
-            if request is not None:
-                self.kv_cache_manager.apply_ngc_eviction(request, proposal)
+        if pending:
+            self.kv_cache_manager.apply_ngc_evictions(self.requests, pending.values())
         pending.clear()
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -665,6 +678,9 @@ class Scheduler(SchedulerInterface):
             # num_prefill_lookahead of the prefill end.
             num_new_tokens = self._reserve_prefill_lookahead(
                 request, request.num_computed_tokens, num_new_tokens
+            )
+            num_new_tokens = self._cap_ngc_chunk(
+                request.num_computed_tokens, num_new_tokens
             )
 
             if num_new_tokens == 0:
@@ -1075,6 +1091,9 @@ class Scheduler(SchedulerInterface):
                     # num_prefill_lookahead of the prefill end.
                     num_new_tokens = self._reserve_prefill_lookahead(
                         request, num_computed_tokens, num_new_tokens
+                    )
+                    num_new_tokens = self._cap_ngc_chunk(
+                        num_computed_tokens, num_new_tokens
                     )
 
                     if num_new_tokens == 0:
@@ -1956,7 +1975,6 @@ class Scheduler(SchedulerInterface):
                         ],
                         page_size=group.kv_cache_spec.block_size,
                         computed_tokens=request.num_computed_tokens,
-                        prompt_tokens=request.num_prompt_tokens,
                         in_flight_tokens=request.num_in_flight_tokens,
                         evicted_tokens=self.kv_cache_manager.get_ngc_evicted_tokens(
                             req_id, proposal.group_id

@@ -45,7 +45,7 @@ def test_ngc_handoff_batches_layers_and_preserves_snapshots(
         decision = NGCEvictionDecision(
             group_id=layer,
             cadence_boundary=128,
-            computed_generated_tokens=128,
+            computed_tokens=128,
             retained_tokens=48,
             page_size=16,
             page_scores=NGCPageScores(scores, ids),
@@ -85,7 +85,7 @@ def _ring_buffers(window, layers=("layer.0",), num_slots=4):
     return buffers
 
 
-def _step(buffers, chunks, queries=None, prompt_lens=None):
+def _step(buffers, chunks, queries=None):
     """Prepare (request, first position, length) chunks, then capture each layer.
 
     Every layer captures every step, as in a real forward. ``queries`` maps a
@@ -103,7 +103,6 @@ def _step(buffers, chunks, queries=None, prompt_lens=None):
         lengths,
         positions,
         [start + length for _, start, length in chunks],
-        prompt_lens,
     )
     for name in buffers._rings:
         values = (
@@ -174,13 +173,12 @@ def test_ring_capture_scores_most_recent_queries(cadence, chunks):
     for chunk in chunks:
         _step(buffers, [("a", length, chunk)])
         length += chunk
-        generated = length - 7
         pages = torch.arange((length + 15) // 16)
         buffers.score_if_due(
             "a",
             "layer.0",
             group_id=0,
-            computed_generated_tokens=max(generated, 0),
+            computed_tokens=length,
             cadence=cadence,
             eviction_rate=0,
             min_retained_tokens=1,
@@ -265,6 +263,9 @@ def test_capture_replays_inside_cuda_graph_with_new_rows():
 def test_due_filter_checks_each_request_boundary_once():
     buffers = _ring_buffers(1)
     assert not buffers.any_due("a", 127, 128)
+    assert buffers.any_due("a", 128, 128, mark_checked=False)
+    assert buffers.any_due("a", 128, 128, mark_checked=False)
+    assert not buffers._checked_boundaries
     assert buffers.any_due("a", 128, 128)
     assert not buffers.any_due("a", 200, 128)
     assert buffers.any_due("a", 256, 128) and buffers.any_due("b", 128, 128)
@@ -337,13 +338,10 @@ def test_scoring_cadence_reduction_and_preemption_replay():
 
     for count in [0, 1]:
         assert (
-            buffers.score_if_due(
-                "a", "layer.0", computed_generated_tokens=count, **args
-            )
-            is None
+            buffers.score_if_due("a", "layer.0", computed_tokens=count, **args) is None
         )
     assert not calls
-    decision = buffers.score_if_due("a", "layer.0", computed_generated_tokens=2, **args)
+    decision = buffers.score_if_due("a", "layer.0", computed_tokens=2, **args)
     assert decision is not None
     assert decision.cadence_boundary == 2 and decision.group_id == 7
     assert decision.victim_indices.tolist() == [2]
@@ -359,11 +357,8 @@ def test_scoring_cadence_reduction_and_preemption_replay():
     assert not buffers.take_proposals({"a": 42}, ["layer.0"])
     decision.page_scores.scores.zero_()
     assert proposal.scores == (3.0, 11.0, 2.0, 0.0)
-    assert (
-        buffers.score_if_due("a", "layer.0", computed_generated_tokens=2, **args)
-        is None
-    )
-    decision = buffers.score_if_due("a", "layer.0", computed_generated_tokens=7, **args)
+    assert buffers.score_if_due("a", "layer.0", computed_tokens=2, **args) is None
+    decision = buffers.score_if_due("a", "layer.0", computed_tokens=7, **args)
     assert decision.cadence_boundary == 6
     assert len(calls) == 2
     torch.testing.assert_close(kernel_table, original_table)
@@ -373,10 +368,7 @@ def test_scoring_cadence_reduction_and_preemption_replay():
     capture()
     for count in [1, 2, 6, 7]:
         assert (
-            buffers.score_if_due(
-                "a", "layer.0", computed_generated_tokens=count, **args
-            )
-            is None
+            buffers.score_if_due("a", "layer.0", computed_tokens=count, **args) is None
         )
     assert len(calls) == 2
     assert buffers.due_boundary("a", "layer.0", 8, 2) == 8
@@ -433,7 +425,7 @@ def test_handoff_accepts_only_completed_current_cache_snapshots(
         group_id=2,
         table_version=version,
         cadence_boundary=2,
-        computed_generated_tokens=2,
+        computed_tokens=48 + evicted_tokens,
         retained_tokens=48,
         page_size=16,
         block_ids=(8, 3, 7),
@@ -447,7 +439,6 @@ def test_handoff_accepts_only_completed_current_cache_snapshots(
         block_ids=[8, 3, 7],
         page_size=16,
         computed_tokens=48 + evicted_tokens,
-        prompt_tokens=46 + evicted_tokens,
         in_flight_tokens=0,
         evicted_tokens=evicted_tokens,
     )
@@ -562,18 +553,18 @@ def test_ngc_capture_gates_each_cadence_and_crossed_prefill(mode, monkeypatch):
         device=torch.device("cpu"),
         cadences={"short": 8, "long": 16},
     )
-    _step(buffers, [("a", 0, 15)], prompt_lens=[10])
+    _step(buffers, [("a", 0, 5)])
     assert not buffers._slots
     assert all(not ring.any() for ring in buffers._rings.values())
-    for position in (15, 16, 17):
-        _step(buffers, [("a", position, 1)], prompt_lens=[10])
-    assert _queries(buffers, "a", "short") == ([15, 16, 17], [15, 16, 17])
+    for position in (5, 6, 7):
+        _step(buffers, [("a", position, 1)])
+    assert _queries(buffers, "a", "short") == ([5, 6, 7], [5, 6, 7])
     assert not buffers._rings["long"].any()
     assert buffers.any_due("a", 8, 8)
     previous = buffers._rings["short"].clone()
-    _step(buffers, [("a", 18, 1)], prompt_lens=[10])
+    _step(buffers, [("a", 8, 1)])
     torch.testing.assert_close(buffers._rings["short"], previous)
-    _step(buffers, [("b", 0, 29)], prompt_lens=[10])
+    _step(buffers, [("b", 0, 29)])
     assert _queries(buffers, "b", "short") == ([26, 27, 28], [26, 27, 28])
     assert _queries(buffers, "b", "long") == (
         [24, 25, 26, 27, 28],
@@ -620,11 +611,10 @@ def test_ngc_full_graph_capture_switches_inactive_active_inactive(monkeypatch):
         np.zeros(3, dtype=np.int64),
         np.arange(3),
         np.array([3]),
-        np.arange(15, 18),
-        [18],
-        [10],
+        np.arange(5, 8),
+        [8],
     )
-    query[:3] = torch.arange(15, 18, device="cuda")[:, None, None]
+    query[:3] = torch.arange(5, 8, device="cuda")[:, None, None]
     graph.replay()
     actual, positions = buffers.get_queries("a", "layer")
     torch.testing.assert_close(
@@ -633,7 +623,7 @@ def test_ngc_full_graph_capture_switches_inactive_active_inactive(monkeypatch):
     assert buffers.any_due("a", 8, 8)
     previous = buffers._rings["layer"].clone()
     buffers.prepare_capture(
-        ["a"], np.array([0]), np.array([0]), np.array([1]), np.array([18]), [19], [10]
+        ["a"], np.array([0]), np.array([0]), np.array([1]), np.array([8]), [9]
     )
     query.fill_(-1)
     graph.replay()
@@ -723,3 +713,586 @@ def test_ngc_packed_score_inputs_match_individual_gathers(kernel_page_size):
     assert workspaces == {
         name: ws.queries.data_ptr() for name, ws in buffers._score_workspaces.items()
     }
+    expected_metadata = {
+        key: (item.key_positions.clone(), item.block_ids.clone())
+        for key, item in prepared.items()
+    }
+    for workspace in buffers._score_workspaces.values():
+        workspace.queries.fill_(-17)
+        workspace.query_positions.fill_(-19)
+    no_gather = buffers.prepare_score_inputs(inputs, gather_queries=False)
+    for key, item in no_gather.items():
+        assert item.queries.eq(-17).all()
+        assert item.query_positions.eq(-19).all()
+        keys, blocks = expected_metadata[key]
+        torch.testing.assert_close(item.key_positions, keys)
+        torch.testing.assert_close(item.block_ids, blocks)
+
+    # Filtering views must still refresh the complete batch used by fused decode.
+    selected = {("a", "short")}
+    for workspace in buffers._score_workspaces.values():
+        workspace.key_positions.fill_(-101)
+        workspace.block_ids.fill_(-103)
+    due = {
+        (item.req_id, item.layer_name): (item.req_id, item.layer_name) in selected
+        for item in inputs
+    }
+    buffers.prepare_fused_decode(inputs, due)
+    assert set(buffers.fused_inputs) == selected
+    for name, state in buffers._fused_decode.items():
+        items = [item for item in inputs if item.layer_name == name]
+        assert state.inputs == items
+        descriptors = state.descriptors.reshape(-1, 8)
+        assert descriptors.shape[0] == len(items)
+        assert descriptors[:, 3].tolist() == [i.retained_tokens for i in items]
+        assert state.due.tolist() == [due[i.req_id, name] for i in items]
+        for row, item in enumerate(items):
+            keys, blocks = expected_metadata[item.req_id, name]
+            torch.testing.assert_close(
+                state.workspace.key_positions[row, : len(keys)], keys
+            )
+            torch.testing.assert_close(
+                state.workspace.block_ids[row, : len(blocks)], blocks
+            )
+    # Standalone fallback still gathers every requested query when no filter is set.
+    fallback = buffers.prepare_score_inputs(inputs)
+    assert set(fallback) == set(expected_queries)
+    for key, item in fallback.items():
+        query, positions = expected_queries[key]
+        torch.testing.assert_close(item.queries, query)
+        torch.testing.assert_close(item.query_positions, positions)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "head_ratio,dim,max_kept",
+    [(1, 64, 145), (2, 64, 145), (4, 64, 145), (7, 128, 2049), (9, 64, 145)],
+)
+@pytest.mark.parametrize("page_size", [16, 32])
+@pytest.mark.parametrize("num_segments", [1, 16])
+def test_ngc_fused_decode_matches_attention_and_standalone_scores(
+    dtype, kv_dtype, head_ratio, dim, max_kept, page_size, num_segments
+):
+    """Decode/scoring casts KV to query dtype and preserves masks and GQA."""
+    from vllm.v1.attention.ops.triton_ngc_decode import ngc_decode_and_score
+    from vllm.v1.attention.ops.triton_ngc_scorer import ngc_page_scores
+    from vllm.v1.worker.ngc_scoring import NGCScratchBuffers
+
+    generator = torch.Generator(device="cuda").manual_seed(37)
+    batch, kv_heads = 3, 2
+    heads = kv_heads * head_ratio
+    window, ring_window, kernel_page = 5, 7, 16
+    kept = [max_kept, 33, 1]
+    sequence_lengths, counts = [max_kept + 15, 48, 1], [5, 3, 1]
+    table_pages = (max_kept + kernel_page - 1) // kernel_page
+    physical_pages = table_pages + 10
+    query = torch.randn(
+        batch, heads, dim, device="cuda", dtype=dtype, generator=generator
+    )
+    storage = torch.randn(
+        physical_pages * 2,
+        kv_heads,
+        kernel_page,
+        2 * dim,
+        device="cuda",
+        dtype=kv_dtype,
+        generator=generator,
+    )
+    cache = storage[::2]
+    assert not cache.is_contiguous()
+    ring = torch.randn(
+        batch * ring_window + 1,
+        heads,
+        dim,
+        device="cuda",
+        dtype=dtype,
+        generator=generator,
+    )
+    table = torch.stack(
+        [
+            torch.randperm(physical_pages, device="cuda", generator=generator)[
+                :table_pages
+            ]
+            for _ in range(batch)
+        ]
+    ).int()
+    descriptors = torch.tensor(
+        [
+            [seq, row, count, length, seq - length, 0, 0, row]
+            for row, (seq, count, length) in enumerate(
+                zip(sequence_lengths, counts, kept)
+            )
+        ],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    positions = torch.zeros((batch, max(kept)), device="cuda", dtype=torch.int64)
+    for row, length in enumerate(kept):
+        # Old retained tokens can be reordered, while the newest token is present.
+        values = torch.arange(
+            sequence_lengths[row] - length, sequence_lengths[row], device="cuda"
+        )
+        permutation = torch.randperm(length, device="cuda", generator=generator)
+        positions[row, :length] = values[permutation]
+        ring[row * ring_window + (sequence_lengths[row] - 1) % ring_window] = query[row]
+    due = torch.tensor([True, False, True], device="cuda")
+    output = torch.empty_like(query)
+    scratch = NGCScratchBuffers()
+    score_buffer = torch.empty(
+        (batch, (max(kept) + page_size - 1) // page_size), device="cuda"
+    )
+    scores = ngc_decode_and_score(
+        query,
+        cache,
+        ring,
+        descriptors,
+        positions,
+        table,
+        due,
+        output,
+        window=window,
+        ring_window=ring_window,
+        page_size=page_size,
+        max_kept=max(kept),
+        softmax_scale=dim**-0.5,
+        num_segments=num_segments,
+        scratch=scratch,
+        score_buffer=score_buffer,
+    )
+    for row, length in enumerate(kept):
+        slots = torch.arange(length, device="cuda")
+        physical = table[row, slots // kernel_page].long()
+        keys = (
+            cache[physical, :, slots % kernel_page, :dim]
+            .repeat_interleave(head_ratio, 1)
+            .to(dtype)
+            .float()
+        )
+        values = (
+            cache[physical, :, slots % kernel_page, dim:]
+            .repeat_interleave(head_ratio, 1)
+            .to(dtype)
+            .float()
+        )
+        logits = torch.einsum("hd,thd->ht", query[row].float(), keys) * dim**-0.5
+        reference = torch.einsum("ht,thd->hd", logits.softmax(-1), values)
+        tolerance = 0.003 if dtype == torch.float16 else 0.025
+        torch.testing.assert_close(
+            output[row].float(), reference, atol=tolerance, rtol=tolerance
+        )
+        if not due[row]:
+            assert not scores[row].any()
+            continue
+        query_positions = torch.arange(
+            sequence_lengths[row] - counts[row], sequence_lengths[row], device="cuda"
+        )
+        recent = ring[row * ring_window + query_positions % ring_window]
+        expected = ngc_page_scores(
+            recent,
+            cache[..., :dim],
+            table[row],
+            length,
+            dim**-0.5,
+            page_size,
+            query_positions=query_positions,
+            key_positions=positions[row, :length],
+        )
+        torch.testing.assert_close(
+            scores[row, : len(expected)], expected, atol=0.003, rtol=0.003
+        )
+        assert not scores[row, len(expected) :].any()
+    assert not scores[2].any(), "A sole retained token is masked from its own score"
+    # Reuse dirty scratch after shortening the first row and disabling scoring.
+    pointers = {name: value.data_ptr() for name, value in scratch.buffers.items()}
+    descriptors[0, 3] = 17
+    due.zero_()
+    scores.fill_(float("nan"))
+    replay = ngc_decode_and_score(
+        query,
+        cache,
+        ring,
+        descriptors,
+        positions,
+        table,
+        due,
+        output,
+        window=window,
+        ring_window=ring_window,
+        page_size=page_size,
+        max_kept=max(kept),
+        softmax_scale=dim**-0.5,
+        num_segments=num_segments,
+        scratch=scratch,
+        score_buffer=score_buffer,
+    )
+    assert replay.data_ptr() == score_buffer.data_ptr()
+    assert not replay.any()
+    assert pointers == {
+        name: value.data_ptr() for name, value in scratch.buffers.items()
+    }
+    slots = torch.arange(17, device="cuda")
+    physical = table[0, slots // kernel_page].long()
+    keys = (
+        cache[physical, :, slots % kernel_page, :dim]
+        .repeat_interleave(head_ratio, 1)
+        .to(dtype)
+        .float()
+    )
+    values = (
+        cache[physical, :, slots % kernel_page, dim:]
+        .repeat_interleave(head_ratio, 1)
+        .to(dtype)
+        .float()
+    )
+    logits = torch.einsum("hd,thd->ht", query[0].float(), keys) * dim**-0.5
+    reference = torch.einsum("ht,thd->hd", logits.softmax(-1), values)
+    torch.testing.assert_close(
+        output[0].float(), reference, atol=tolerance, rtol=tolerance
+    )
+
+
+def test_ngc_precomputed_scores_skip_standalone_scorer():
+    """Fused scores still rank pages and commit cadence without scoring again."""
+    buffers = _ring_buffers(2)
+    _step(buffers, [("a", 62, 2)])
+    scores = torch.tensor([3.0, 1.0, 2.0, 0.0])
+
+    def forbidden_scorer(*args, **kwargs):
+        raise AssertionError("Precomputed scores must bypass the standalone scorer")
+
+    args = dict(
+        group_id=0,
+        computed_tokens=128,
+        cadence=128,
+        eviction_rate=0.5,
+        min_retained_tokens=16,
+        key_cache=torch.empty(0),
+        kernel_block_table=torch.arange(4),
+        block_ids=torch.tensor([8, 3, 7, 9]),
+        key_positions=torch.arange(64),
+        page_size=16,
+        softmax_scale=0.5,
+        score_fn=forbidden_scorer,
+        precomputed_scores=scores,
+    )
+    decision = buffers.score_if_due("a", "layer.0", **args)
+    assert decision is not None
+    assert decision.victim_indices.tolist() == [1]
+    assert decision.victim_block_ids.tolist() == [3]
+    torch.testing.assert_close(decision.page_scores.scores, scores)
+    scores.zero_()
+    assert decision.page_scores.scores.tolist() == [3.0, 1.0, 2.0, 0.0]
+    assert buffers.score_if_due("a", "layer.0", **args) is None
+
+
+def test_ngc_scratch_reuses_capacity_and_grows_without_aliasing_names():
+    """Serial layers reuse flat storage; growth preserves independent workspaces."""
+    from vllm.v1.worker.ngc_scoring import NGCScratchBuffers
+
+    scratch = NGCScratchBuffers()
+    device = torch.device("cpu")
+    first = scratch.get("partials", (3, 5), device)
+    first.fill_(7)
+    assert first.dtype == torch.float32 and first.is_contiguous()
+    assert first.untyped_storage().nbytes() == 16 * first.element_size()
+    smaller = scratch.get("partials", (2, 4), device)
+    assert smaller.data_ptr() == first.data_ptr()
+    assert smaller.shape == (2, 4) and smaller.is_contiguous()
+    assert smaller.eq(7).all()
+    independent = scratch.get("segment_sum", (2, 4), device)
+    independent.fill_(9)
+    assert independent.data_ptr() != first.data_ptr()
+    grown = scratch.get("partials", (5, 7), device)
+    assert grown.data_ptr() != first.data_ptr()
+    assert grown.untyped_storage().nbytes() == 64 * grown.element_size()
+    grown.fill_(3)
+    assert independent.eq(9).all()
+    reused = scratch.get("partials", (4, 8), device)
+    assert reused.data_ptr() == grown.data_ptr()
+    assert reused.eq(3).all()
+
+
+def test_ngc_fused_layers_share_scratch_but_preserve_scores(monkeypatch):
+    """The next serial layer cannot overwrite scores awaiting eviction handoff."""
+    import sys
+    from types import SimpleNamespace
+
+    buffers = _ring_buffers(2, layers=("first", "second"))
+    shared = []
+
+    def decode(*args, scratch, score_buffer, **kwargs):
+        shared.append(scratch)
+        # Scratch is deliberately overwritten on each serial invocation.
+        scratch.get("partials", (3, 5), torch.device("cpu")).fill_(len(shared))
+        score_buffer.fill_(len(shared))
+        return score_buffer
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.attention.ops.triton_ngc_decode",
+        SimpleNamespace(ngc_decode_and_score=decode),
+    )
+    for layer in ("first", "second"):
+        buffers._fused_decode[layer] = SimpleNamespace(
+            inputs=[
+                SimpleNamespace(
+                    retained_tokens=32,
+                    page_size=16,
+                    block_table=torch.zeros((1, 2), dtype=torch.int32),
+                )
+            ],
+            descriptors=torch.zeros((1, 8), dtype=torch.int64),
+            workspace=SimpleNamespace(key_positions=torch.arange(32).view(1, -1)),
+            due=torch.tensor([True]),
+            scores=None,
+        )
+    query, output = torch.ones((1, 1, 1)), torch.empty((1, 1, 1))
+    assert buffers.fused_decode("first", query, torch.empty(0), output, 1.0)
+    first = buffers._fused_decode["first"].scores
+    assert buffers.fused_decode("second", query, torch.empty(0), output, 1.0)
+    second = buffers._fused_decode["second"].scores
+    assert first.data_ptr() != second.data_ptr()
+    assert first.eq(1).all() and second.eq(2).all()
+    assert shared[0] is shared[1]
+    assert buffers.fused_decode("first", query, torch.empty(0), output, 1.0)
+    assert buffers._fused_decode["first"].scores.data_ptr() == first.data_ptr()
+    assert second.eq(2).all()
+
+
+def _mock_ngc_graph_streams(monkeypatch):
+    import contextlib
+
+    events = []
+
+    class Stream:
+        def wait_stream(self, other):
+            events.append((self, other))
+
+    caller = Stream()
+    monkeypatch.setattr(torch.cuda, "Stream", Stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: caller)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
+    return caller, events
+
+
+def test_ngc_boundary_graph_replays_contents_and_invalidates_layout(monkeypatch):
+    """Persistent values replay; storage, layout and scalar changes recapture."""
+    import contextlib
+    import gc
+    import weakref
+
+    from vllm.v1.worker.ngc_cudagraph import NGCBoundaryGraph
+
+    events = []
+
+    class Graph:
+        def replay(self):
+            events.append("replay")
+
+    @contextlib.contextmanager
+    def capture(graph, stream):
+        events.append("capture")
+        yield
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    caller, waits = _mock_ngc_graph_streams(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "graph", capture)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+    cache = NGCBoundaryGraph()
+    tensor = torch.ones((2, 3))
+    state = {"input": tensor, "bucket": 8}
+    forwards = []
+
+    def forward():
+        forwards.append(1)
+        return {"output": state["input"]}
+
+    dependencies = lambda: state.copy()
+    output = cache.run(forward, dependencies)
+    assert len(forwards) == 2 and cache.captures == 1 and cache.replays == 0
+    tensor.fill_(4)
+    assert cache.run(forward, dependencies) is output
+    assert len(forwards) == 2 and cache.replays == 1
+    state["input"] = tensor.view(3, 2)
+    cache.run(forward, dependencies)
+    assert cache.captures == 2
+    state["input"] = state["input"].clone()
+    cache.run(forward, dependencies)
+    assert cache.captures == 3
+    state["bucket"] = 16
+    cache.run(forward, dependencies)
+    assert cache.captures == 4
+    assert events.count("capture") == 4 and events.count("sync") == 4
+    assert events.count("replay") == 5
+    assert waits == [(cache.stream, caller), (caller, cache.stream)] * 4
+    # The single cached entry owns dependencies until explicitly discarded.
+    reference = weakref.ref(state["input"])
+    state.clear()
+    gc.collect()
+    assert reference() is not None
+    cache.clear()
+    gc.collect()
+    assert reference() is None
+    assert cache.graph is cache.output is cache.dependencies is cache.key is None
+    assert cache.captures == 4 and cache.replays == 1
+
+
+def test_ngc_boundary_graph_rejects_storage_change_during_capture(monkeypatch):
+    """Warmup may grow buffers, but capture cannot change their addresses."""
+    import contextlib
+
+    from vllm.v1.worker.ngc_cudagraph import NGCBoundaryGraph
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: object())
+    _mock_ngc_graph_streams(monkeypatch)
+    monkeypatch.setattr(
+        torch.cuda, "graph", lambda *args, **kwargs: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    cache = NGCBoundaryGraph()
+    values = [torch.ones(2)]
+
+    def forward():
+        values[0] = values[0].clone()
+        return values[0]
+
+    with pytest.raises(RuntimeError, match="changed during capture"):
+        cache.run(forward, lambda: values[0])
+    assert cache.graph is None and cache.captures == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_ngc_boundary_kernel_graph_reads_updated_persistent_inputs():
+    """Replay observes new due flags, lengths and tables without new addresses."""
+    from vllm.v1.attention.ops.triton_ngc_decode import ngc_decode_and_score
+    from vllm.v1.worker.ngc_scoring import NGCScratchBuffers
+
+    query = torch.randn((1, 7, 64), dtype=torch.float16, device="cuda")
+    cache = torch.randn((4, 1, 16, 128), dtype=torch.float16, device="cuda")
+    ring = torch.randn((6, 7, 64), dtype=torch.float16, device="cuda")
+    descriptors = torch.tensor([[33, 0, 5, 33, 0, 0, 0, 0]], device="cuda")
+    positions = torch.arange(64, device="cuda").view(1, -1)
+    table = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device="cuda")
+    due = torch.tensor([True], device="cuda")
+    scratch = NGCScratchBuffers()
+    output = torch.empty_like(query)
+    scores = torch.empty((1, 4), device="cuda")
+
+    def run(target, storage, destination):
+        return ngc_decode_and_score(
+            query,
+            cache,
+            ring,
+            descriptors,
+            positions,
+            table,
+            due,
+            target,
+            window=5,
+            ring_window=5,
+            page_size=16,
+            max_kept=64,
+            softmax_scale=0.125,
+            scratch=storage,
+            score_buffer=destination,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run(output, scratch, scores)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(output, scratch, scores)
+    for active, kept in ((False, 17), (True, 33)):
+        due.fill_(active)
+        descriptors[0, 3] = kept
+        table.copy_(table.flip(1))
+        graph.replay()
+        expected_output = torch.empty_like(output)
+        expected_scores = torch.empty_like(scores)
+        run(expected_output, NGCScratchBuffers(), expected_scores)
+        torch.testing.assert_close(output, expected_output)
+        torch.testing.assert_close(scores, expected_scores)
+
+
+def test_ngc_boundary_graph_declined_fusion_returns_single_warm_forward(monkeypatch):
+    """A backend fallback must not capture or repeat its ordinary forward."""
+    from vllm.v1.worker.ngc_cudagraph import NGCBoundaryGraph
+
+    calls = []
+    output = torch.ones(2)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Declined fusion must not touch CUDA graph APIs")
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", forbidden)
+    caller, waits = _mock_ngc_graph_streams(monkeypatch)
+    monkeypatch.setattr(torch.accelerator, "synchronize", forbidden)
+    cache = NGCBoundaryGraph()
+
+    def forward():
+        calls.append(1)
+        return output
+
+    assert cache.run(forward, lambda: output, capture_ready=lambda: False) is output
+    assert len(calls) == 1
+    assert cache.graph is cache.dependencies is cache.output is None
+    assert cache.captures == cache.replays == 0
+    assert waits == [(cache.stream, caller), (caller, cache.stream)]
+
+
+def test_ngc_reserved_score_buffer_is_not_published_before_computation():
+    """Reserved output storage is not a completed fused result."""
+    from types import SimpleNamespace
+
+    buffers = NGCScoringBuffers()
+    reserved = torch.full((1, 2), float("nan"))
+    buffers._fused_decode["layer"] = SimpleNamespace(
+        inputs=[SimpleNamespace(req_id="a", retained_tokens=32, page_size=16)],
+        score_buffer=reserved,
+        scores=None,
+    )
+    assert buffers.get_fused_scores("a", "layer") is None
+    assert not buffers.fused_graph_ready()
+    # A successful replay publishes its persistent output without a Python kernel call.
+    reserved.fill_(2)
+    buffers.publish_fused_graph_scores()
+    torch.testing.assert_close(buffers.get_fused_scores("a", "layer"), reserved[0])
+    assert buffers.fused_graph_ready()
+
+
+@pytest.mark.parametrize("num_reqs", [0, 2])
+def test_ngc_retained_lengths_share_full_vectors_without_aliasing_backing_rows(
+    num_reqs,
+):
+    """Equal maxima alone cannot merge layers, and later divergence splits views."""
+    from vllm.v1.worker.ngc_scoring import share_ngc_retained_lengths
+
+    retained = CpuGpuBuffer(
+        3, 4, dtype=torch.int32, device=torch.device("cpu"), pin_memory=False
+    )
+    retained.np[:] = [[10, 6, 77, 88], [10, 6, 99, 66], [6, 10, 77, 88]]
+    retained.copy_to_gpu()
+    before = retained.cpu.clone()
+    views = share_ngc_retained_lengths(retained, num_reqs)
+    assert views[0] is views[1]
+    assert views[0][2] == (10 if num_reqs else 0)
+    if num_reqs:
+        assert views[0] is not views[2], "The entire vector must match, not its maximum"
+        assert views[1][0].data_ptr() == retained.gpu[0].data_ptr()
+        assert retained.gpu[0].data_ptr() != retained.gpu[1].data_ptr()
+        retained.np[1, 1] = 5
+        retained.copy_to_gpu()
+        split = share_ngc_retained_lengths(retained, num_reqs)
+        assert split[0] is not split[1]
+        assert split[1][0].data_ptr() == retained.gpu[1].data_ptr()
+        assert split[0][1].tolist() == [10, 6]
+        assert split[1][1].tolist() == [10, 5]
+        retained.np[1, 1] = 6
+        retained.copy_to_gpu()
+        assert share_ngc_retained_lengths(retained, num_reqs)[0][1].tolist() == [10, 6]
+    torch.testing.assert_close(retained.cpu, before)

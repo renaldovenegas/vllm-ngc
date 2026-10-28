@@ -145,6 +145,7 @@ def test_ngc_compacted_slots_and_attention_match_original_position_mask(
 
 @pytest.mark.parametrize("layout", list(KVCacheLayout))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("position_case", ["all_past", "mixed", "no_past"])
 @pytest.mark.parametrize(
     "num_q,kept_len,head_dim,group_size,scoring_pages,query_scale",
@@ -159,6 +160,7 @@ def test_ngc_compacted_slots_and_attention_match_original_position_mask(
 def test_ngc_page_scores_match_retained_key_softmax(
     layout,
     dtype,
+    kv_dtype,
     position_case,
     num_q,
     kept_len,
@@ -174,7 +176,7 @@ def test_ngc_page_scores_match_retained_key_softmax(
     shape = (2, num_pages, num_kv_heads, page_size, 2 * head_dim)
     order = layout.stride_order
     storage = torch.randn(
-        tuple(shape[i] for i in order), device=DEVICE_TYPE, dtype=dtype
+        tuple(shape[i] for i in order), device=DEVICE_TYPE, dtype=kv_dtype
     )
     cache = storage.permute(*(order.index(i) for i in range(5)))[1]
     keys = cache[..., :head_dim]
@@ -216,7 +218,9 @@ def test_ngc_page_scores_match_retained_key_softmax(
         retained = keys[table[:needed_pages].long()].transpose(1, 2)
         retained = retained.reshape(-1, num_kv_heads, head_dim)[:kept_len]
         retained = retained.repeat_interleave(group_size, dim=1)
-        logits = torch.einsum("qhd,khd->qhk", queries.float(), retained.float())
+        logits = torch.einsum(
+            "qhd,khd->qhk", queries.float(), retained.to(dtype).float()
+        )
         logits = (logits * scale).masked_fill(~allowed[:, None, :], -float("inf"))
         # Define empty attention rows as zero rather than softmax(-inf) NaNs.
         has_keys = allowed.any(dim=-1)[:, None, None]

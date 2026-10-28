@@ -72,7 +72,7 @@ def test_ngc_scheduler_applies_completed_proposal_before_next_allocation(
             num_kv_heads=1,
             head_size=64,
             dtype=torch.float16,
-            cadence=1,
+            cadence=65,
             eviction_rate=0.5,
         ),
         num_blocks=16,
@@ -98,8 +98,8 @@ def test_ngc_scheduler_applies_completed_proposal_before_next_allocation(
         layer_name="layer",
         group_id=0,
         table_version=decode.ngc_table_versions[rid],
-        cadence_boundary=1,
-        computed_generated_tokens=1,
+        cadence_boundary=65,
+        computed_tokens=65,
         retained_tokens=65,
         page_size=16,
         block_ids=block_ids,
@@ -140,6 +140,84 @@ def test_ngc_scheduler_applies_completed_proposal_before_next_allocation(
         ),
     )
     assert not scheduler.schedule().ngc_cache_updates
+
+
+@pytest.mark.parametrize("prompt_tokens", [100, 256, 600])
+def test_ngc_clock_includes_prompt_and_stops_prefill_at_boundaries(
+    tmp_path, monkeypatch, prompt_tokens
+):
+    """Apply eviction before any forward crosses a total-token cadence boundary."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.device_type:
+        monkeypatch.setattr(current_platform, "device_type", "cpu")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    cadence = 256
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        kv_cache_spec=NGCEvictionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.float16,
+            cadence=cadence,
+            eviction_rate=0.5,
+        ),
+        skip_tokenizer_init=True,
+    )
+    (request,) = create_requests(
+        num_requests=1, num_tokens=prompt_tokens, max_tokens=512
+    )
+    rid = request.request_id
+    scheduler.add_request(request)
+    last_boundary = (prompt_tokens // cadence + 1) * cadence
+    boundaries = []
+    evicted = 0
+    expect_update = False
+    while request.num_computed_tokens <= last_boundary:
+        before = request.num_computed_tokens
+        scheduled = scheduler.schedule()
+        computed = request.num_computed_tokens
+        assert before < computed <= (before // cadence + 1) * cadence
+        if expect_update:
+            update = scheduled.ngc_cache_updates[rid][0]
+            assert update.evicted_tokens == evicted
+        proposals = []
+        expect_update = computed % cadence == 0
+        if expect_update:
+            boundaries.append(computed)
+            block_ids = tuple(scheduler.kv_cache_manager.get_block_ids(rid)[0])
+            victims = tuple(range((len(block_ids) - 1) // 2))
+            proposals.append(
+                NGCEvictionProposal(
+                    request_id=rid,
+                    layer_name="layer",
+                    group_id=0,
+                    table_version=scheduled.ngc_table_versions[rid],
+                    cadence_boundary=computed,
+                    computed_tokens=computed,
+                    retained_tokens=computed - evicted,
+                    page_size=16,
+                    block_ids=block_ids,
+                    scores=None,
+                    victim_indices=victims,
+                    victim_block_ids=tuple(block_ids[i] for i in victims),
+                )
+            )
+            evicted += 16 * len(victims)
+        scheduler.update_from_output(
+            scheduled,
+            ModelRunnerOutput(
+                req_ids=[rid],
+                req_id_to_index={rid: 0},
+                sampled_token_ids=[[10] if computed >= prompt_tokens else []],
+                ngc_eviction_proposals=proposals,
+            ),
+        )
+        assert bool(scheduler.ngc_eviction_inbox.pending) == expect_update
+    assert boundaries == list(range(cadence, last_boundary + 1, cadence))
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():

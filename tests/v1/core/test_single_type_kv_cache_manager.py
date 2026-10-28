@@ -62,7 +62,7 @@ def test_ngc_eviction_reclaims_only_victims_and_allocates_after_retained_tail(co
         group_id=0,
         table_version=1,
         cadence_boundary=2,
-        computed_generated_tokens=2,
+        computed_tokens=2,
         retained_tokens=17,
         page_size=4,
         block_ids=tuple(b.block_id for b in blocks),
@@ -118,7 +118,7 @@ def test_ngc_zero_victim_proposal_does_not_dirty_or_rebuild_layout(rate):
         group_id=0,
         table_version=1,
         cadence_boundary=1,
-        computed_generated_tokens=1,
+        computed_tokens=1,
         retained_tokens=17,
         page_size=4,
         block_ids=None,
@@ -968,7 +968,7 @@ def test_ngc_batched_allocation_preserves_layer_layouts(mixed):
             group_id=0,
             table_version=1,
             cadence_boundary=32,
-            computed_generated_tokens=32,
+            computed_tokens=32,
             retained_tokens=17,
             page_size=4,
             block_ids=None,
@@ -988,3 +988,109 @@ def test_ngc_batched_allocation_preserves_layer_layouts(mixed):
         blocks = coordinator.pop_blocks_for_free("a")
         coordinator.block_pool.free_blocks(reversed(blocks))
     allocate("a", 13)
+
+
+@pytest.mark.parametrize("invalid_layer", [None, 1])
+def test_ngc_batched_eviction_matches_sequential_release_order(invalid_layer):
+    """Batching preserves layouts, independent rejections and allocation order."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    def setup():
+        pool = BlockPool(128, enable_caching=False, hash_block_size=4)
+        spec = NGCEvictionSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float16,
+            eviction_rate=0.5,
+        )
+        managers = [
+            NGCEvictionManager(spec, pool, False, group, 4) for group in range(3)
+        ]
+        proposals = []
+        for request in ("a", "b"):
+            for group, manager in enumerate(managers):
+                blocks = manager.allocate_new_blocks(request, 17, 17)
+                if request == "b" and group > 0:
+                    continue
+                proposal = NGCEvictionProposal(
+                    request_id=request,
+                    layer_name=f"layer.{group}",
+                    group_id=group,
+                    table_version=1,
+                    cadence_boundary=128,
+                    computed_tokens=128,
+                    retained_tokens=17,
+                    page_size=4,
+                    block_ids=None,
+                    scores=None,
+                    victim_indices=(0, 2),
+                    victim_block_ids=(blocks[0].block_id, blocks[2].block_id),
+                )
+                if request == "a" and group == invalid_layer:
+                    proposal = replace(proposal, victim_block_ids=(-1, -2))
+                proposals.append(proposal)
+        requests = {
+            name: SimpleNamespace(
+                num_computed_tokens=17,
+                num_in_flight_tokens=0,
+                is_finished=Mock(return_value=False),
+            )
+            for name in ("a", "b")
+        }
+        requests["finished"] = SimpleNamespace(
+            num_computed_tokens=17,
+            num_in_flight_tokens=0,
+            is_finished=Mock(return_value=True),
+        )
+        requests["inflight"] = SimpleNamespace(
+            num_computed_tokens=17,
+            num_in_flight_tokens=1,
+            is_finished=Mock(return_value=False),
+        )
+        proposals.extend(
+            replace(proposals[0], request_id=name)
+            for name in ("finished", "inflight", "missing")
+        )
+        wrapper = object.__new__(KVCacheManager)
+        wrapper.coordinator = SimpleNamespace(
+            single_type_managers=managers, block_pool=pool
+        )
+        return wrapper, requests, proposals
+
+    batched, requests, proposals = setup()
+    sequential, other_requests, other_proposals = setup()
+    pool = batched.coordinator.block_pool
+    original_free = pool.free_blocks
+    calls = []
+
+    def free(blocks):
+        blocks = list(blocks)
+        calls.append([block.block_id for block in blocks])
+        original_free(blocks)
+
+    pool.free_blocks = free
+    accepted = batched.apply_ngc_evictions(requests, proposals)
+    expected = sum(
+        sequential.apply_ngc_eviction(other_requests[p.request_id], p)
+        for p in other_proposals
+        if p.request_id in other_requests
+    )
+    assert accepted == expected == (4 if invalid_layer is None else 3)
+    assert len(calls) == 1
+    assert requests["a"].is_finished.call_count == 1
+    for left, right in zip(
+        batched.coordinator.single_type_managers,
+        sequential.coordinator.single_type_managers,
+    ):
+        for request in ("a", "b"):
+            assert left.get_cache_update(request) == right.get_cache_update(request)
+        assert left.changed_requests == right.changed_requests
+    free_count = pool.get_num_free_blocks()
+    assert free_count == sequential.coordinator.block_pool.get_num_free_blocks()
+    assert [b.block_id for b in pool.get_new_blocks(free_count)] == [
+        b.block_id for b in sequential.coordinator.block_pool.get_new_blocks(free_count)
+    ]

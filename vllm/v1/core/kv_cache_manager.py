@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -382,6 +382,46 @@ class KVCacheManager:
         manager = self.coordinator.single_type_managers[proposal.group_id]
         assert isinstance(manager, NGCEvictionManager)
         return manager.apply_eviction(proposal, request.num_computed_tokens)
+
+    def apply_ngc_evictions(
+        self,
+        requests: Mapping[str, Request],
+        proposals: Iterable[NGCEvictionProposal],
+    ) -> int:
+        """Validate request state once and release all layer victims together."""
+        computed_by_request: dict[str, int | None] = {}
+        removed_batches: list[list[KVCacheBlock]] = []
+        accepted = 0
+        managers = self.coordinator.single_type_managers
+        try:
+            for proposal in proposals:
+                request_id = proposal.request_id
+                if request_id not in computed_by_request:
+                    request = requests.get(request_id)
+                    computed_by_request[request_id] = (
+                        request.num_computed_tokens
+                        if request is not None
+                        and not request.is_finished()
+                        and request.num_in_flight_tokens == 0
+                        else None
+                    )
+                computed = computed_by_request[request_id]
+                if computed is None:
+                    continue
+                manager = managers[proposal.group_id]
+                assert isinstance(manager, NGCEvictionManager)
+                removed = manager.detach_eviction_blocks(proposal, computed)
+                if removed is not None:
+                    accepted += 1
+                    if removed:
+                        removed_batches.append(removed)
+        finally:
+            if removed_batches:
+                # Each old free call prepended its victims. Preserve that order.
+                self.coordinator.block_pool.free_blocks(
+                    itertools.chain.from_iterable(reversed(removed_batches))
+                )
+        return accepted
 
     def allocate_slots(
         self,

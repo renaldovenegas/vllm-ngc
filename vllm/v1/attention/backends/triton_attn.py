@@ -39,7 +39,10 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
     triton_reshape_and_cache_flash_per_token_head_quant,
 )
-from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+from vllm.v1.attention.ops.triton_unified_attention import (
+    _get_tile_size,
+    unified_attention,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
@@ -595,6 +598,25 @@ class TritonAttentionImpl(AttentionImpl):
             return output.fill_(0)
 
         assert attn_metadata.use_cascade is False
+
+        fused_decode = getattr(layer, "ngc_fused_decode", None)
+        if (
+            fused_decode is not None
+            and attn_metadata.max_query_len == 1
+            and output_scale is None
+        ):
+            split_decode = (
+                attn_metadata.seq_lens.shape[0] <= attn_metadata.seq_threshold_3D
+                and not envs.VLLM_BATCH_INVARIANT
+            )
+            num_segments = attn_metadata.num_par_softmax_segments if split_decode else 1
+            tile_size = _get_tile_size(
+                self.head_size, 0, query.element_size(), is_prefill=not split_decode
+            )
+            if fused_decode(
+                query, kv_cache, output, self.scale, num_segments, tile_size
+            ):
+                return output
 
         # IMPORTANT!
         # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in

@@ -15,6 +15,30 @@ from vllm.v1.ngc_eviction import NGCEvictionProposal
 from vllm.v1.utils import CpuGpuBuffer
 
 
+def share_ngc_retained_lengths(
+    retained: CpuGpuBuffer, num_reqs: int
+) -> list[tuple[torch.Tensor, torch.Tensor, int]]:
+    """Share batch-local length views only when every request's length matches.
+
+    Keep the independent backing rows populated for ordinary CUDA graphs, whose
+    captured pointers must remain valid even when layer lengths later diverge.
+    """
+    shared: dict[bytes, tuple[torch.Tensor, torch.Tensor, int]] = {}
+    result = []
+    for column, row in enumerate(retained.np[:, :num_reqs]):
+        key = row.tobytes()
+        views = shared.get(key)
+        if views is None:
+            views = (
+                retained.gpu[column, :num_reqs],
+                retained.cpu[column, :num_reqs],
+                int(row.max()) if num_reqs else 0,
+            )
+            shared[key] = views
+        result.append(views)
+    return result
+
+
 @dataclass
 class NGCPageScores:
     scores: torch.Tensor
@@ -27,7 +51,7 @@ class NGCEvictionDecision:
 
     group_id: int
     cadence_boundary: int
-    computed_generated_tokens: int
+    computed_tokens: int
     retained_tokens: int
     page_size: int
     page_scores: NGCPageScores
@@ -44,7 +68,7 @@ class NGCEvictionDecision:
             group_id=self.group_id,
             table_version=table_version,
             cadence_boundary=self.cadence_boundary,
-            computed_generated_tokens=self.computed_generated_tokens,
+            computed_tokens=self.computed_tokens,
             retained_tokens=self.retained_tokens,
             page_size=self.page_size,
             block_ids=tuple(self.page_scores.block_ids.tolist()),
@@ -123,6 +147,40 @@ class NGCScoreWorkspace:
     block_ids: torch.Tensor
 
 
+class NGCScratchBuffers:
+    """Grow-only FP32 storage; shaped views keep kernel indexing contiguous.
+
+    Scratch can be shared by successive layers on the same CUDA stream. Outputs
+    that survive a layer must use separate names or a separate buffer owner.
+    """
+
+    def __init__(self) -> None:
+        self.buffers: dict[str, torch.Tensor] = {}
+
+    def get(
+        self, name: str, shape: tuple[int, ...], device: torch.device
+    ) -> torch.Tensor:
+        size = 1
+        for dimension in shape:
+            size *= dimension
+        buffer = self.buffers.get(name)
+        if buffer is None or buffer.numel() < size or buffer.device != device:
+            capacity = 1 << (max(size, 1) - 1).bit_length()
+            buffer = torch.empty(capacity, dtype=torch.float32, device=device)
+            self.buffers[name] = buffer
+        return buffer[:size].view(shape)
+
+
+@dataclass
+class NGCFusedDecodeState:
+    inputs: list[NGCScoreInput]
+    descriptors: torch.Tensor
+    workspace: NGCScoreWorkspace
+    due: torch.Tensor
+    scores: torch.Tensor | None = None
+    score_buffer: torch.Tensor | None = None
+
+
 class NGCScoringBuffers:
     """Per-layer query rings keyed by request slot, independent of batch order.
 
@@ -157,6 +215,12 @@ class NGCScoringBuffers:
         self._seq_lens: dict[str, int] = {}
         self._score_inputs: CpuGpuBuffer | None = None
         self._score_workspaces: dict[str, NGCScoreWorkspace] = {}
+        self._prepared_groups: dict[str, tuple[torch.Tensor, NGCScoreWorkspace]] = {}
+        self.fused_inputs: dict[tuple[str, str], NGCPreparedScoreInput] = {}
+        self._fused_decode: dict[str, NGCFusedDecodeState] = {}
+        self._fused_scratch = NGCScratchBuffers()
+        self._fused_scores = NGCScratchBuffers()
+        self._fused_due: dict[str, CpuGpuBuffer] = {}
 
     def allocate(
         self,
@@ -211,6 +275,11 @@ class NGCScoringBuffers:
         self._seq_lens = {}
         self._score_inputs = None
         self._score_workspaces = {}
+        self._prepared_groups.clear()
+        self.reset_fused_decode()
+        self._fused_scratch = NGCScratchBuffers()
+        self._fused_scores = NGCScratchBuffers()
+        self._fused_due.clear()
 
     def _slot(self, req_id: str) -> int:
         slot = self._slots.get(req_id)
@@ -229,7 +298,6 @@ class NGCScoringBuffers:
         num_scheduled_tokens: np.ndarray,
         positions: np.ndarray,
         seq_lens: Sequence[int],
-        prompt_lens: Sequence[int] | None = None,
     ) -> None:
         """Keep the queries needed at the current or next scoring boundary."""
         assert self._capture_rows is not None
@@ -240,10 +308,7 @@ class NGCScoringBuffers:
             window, cadence = group
             keep = query_pos >= num_scheduled_tokens[req_indices] - window
             if cadence is not None:
-                if prompt_lens is None:
-                    raise ValueError("Cadenced NGC capture requires prompt lengths")
-                prompts = np.asarray(prompt_lens, dtype=np.int64)
-                generated = np.asarray(seq_lens, dtype=np.int64) - prompts
+                computed = np.asarray(seq_lens, dtype=np.int64)
                 checked = np.fromiter(
                     (
                         self._checked_boundaries.get((req_id, cadence), 0)
@@ -252,12 +317,12 @@ class NGCScoringBuffers:
                     np.int64,
                     len(req_ids),
                 )
-                due = generated // cadence * cadence > checked
-                token_generated = positions + 1 - prompts[req_indices]
+                due = computed // cadence * cadence > checked
+                token_count = positions + 1
                 next_boundary = np.maximum(
-                    cadence, (token_generated + cadence - 1) // cadence * cadence
+                    cadence, (token_count + cadence - 1) // cadence * cadence
                 )
-                keep &= due[req_indices] | (next_boundary - token_generated < window)
+                keep &= due[req_indices] | (next_boundary - token_count < window)
             active = bool(keep.any())
             if active and destinations is None:
                 slots = np.fromiter(
@@ -284,6 +349,7 @@ class NGCScoringBuffers:
 
     def reset_capture(self) -> None:
         """Send every row to scratch, for dummy runs and graph capture."""
+        self.reset_fused_decode()
         if self._capture_rows is None:
             return
         for group, buffer in self._capture_groups.items():
@@ -326,9 +392,20 @@ class NGCScoringBuffers:
             )
 
     def prepare_score_inputs(
-        self, inputs: Sequence[NGCScoreInput]
+        self,
+        inputs: Sequence[NGCScoreInput],
+        *,
+        gather_queries: bool = True,
+        materialize_keys: set[tuple[str, str]] | None = None,
     ) -> dict[tuple[str, str], NGCPreparedScoreInput]:
-        """Transfer descriptors once and gather all due requests per layer."""
+        """Prepare page metadata and optionally gather historical queries.
+
+        With ``gather_queries=False``, returned query views are not populated;
+        fused decode reads the rings after forward captures the current query.
+        ``materialize_keys`` limits returned per-request views, while batched
+        metadata is still prepared for every input required by decode.
+        """
+        self._prepared_groups = {}
         if not inputs:
             return {}
         from vllm.v1.attention.ops.triton_ngc_inputs import prepare_ngc_score_inputs
@@ -411,7 +488,12 @@ class NGCScoringBuffers:
                 )
                 self._score_workspaces[layer_name] = workspace
             width = ring.shape[1] * ring.shape[2]
-            tiles = (max(max_kept, window * width) + 255) // 256
+            self._prepared_groups[layer_name] = (
+                self._score_inputs.gpu[start * 8 : (start + batch) * 8],
+                workspace,
+            )
+            work = max(max_kept, window * width) if gather_queries else max_kept
+            tiles = (max(work, 1) + 255) // 256
             prepare_ngc_score_inputs[(batch * tiles,)](
                 ring,
                 self._score_inputs.gpu,
@@ -431,11 +513,15 @@ class NGCScoringBuffers:
                 PAGE_SIZE=page_size,
                 KERNEL_PAGE_SIZE=items[0].kernel_page_size,
                 BLOCK=256,
+                GATHER_QUERIES=gather_queries,
             )
             for i, item in enumerate(items):
+                key = (item.req_id, layer_name)
+                if materialize_keys is not None and key not in materialize_keys:
+                    continue
                 count = min(window, self._seq_lens[item.req_id])
                 pages = (item.retained_tokens + page_size - 1) // page_size
-                prepared[item.req_id, layer_name] = NGCPreparedScoreInput(
+                prepared[key] = NGCPreparedScoreInput(
                     workspace.queries[i, :count],
                     workspace.query_positions[i, :count],
                     workspace.key_positions[i, : item.retained_tokens],
@@ -443,6 +529,132 @@ class NGCScoringBuffers:
                 )
             start += batch
         return prepared
+
+    def reset_fused_decode(self) -> None:
+        self._fused_decode.clear()
+        self.fused_inputs.clear()
+
+    def prepare_fused_decode(
+        self, inputs: Sequence[NGCScoreInput], due: dict[tuple[str, str], bool]
+    ) -> None:
+        """Stage boundary metadata before forward; queries are read from rings later."""
+        self.reset_fused_decode()
+        self.fused_inputs = self.prepare_score_inputs(
+            inputs,
+            gather_queries=False,
+            materialize_keys={key for key, is_due in due.items() if is_due},
+        )
+        grouped: dict[str, list[NGCScoreInput]] = {}
+        for item in inputs:
+            grouped.setdefault(item.layer_name, []).append(item)
+        for layer_name, items in grouped.items():
+            descriptors, workspace = self._prepared_groups[layer_name]
+            batch = len(items)
+            due_buffer = self._fused_due.get(layer_name)
+            if due_buffer is None or due_buffer.gpu.numel() < batch:
+                due_buffer = CpuGpuBuffer(
+                    1 << (batch - 1).bit_length(),
+                    dtype=torch.bool,
+                    device=descriptors.device,
+                    pin_memory=descriptors.device.type == "cuda",
+                )
+                self._fused_due[layer_name] = due_buffer
+            due_buffer.np[:batch] = [due[item.req_id, layer_name] for item in items]
+            due_buffer.copy_to_gpu(batch)
+            capacity = workspace.key_positions.shape[1]
+            pages = (capacity + items[0].page_size - 1) // items[0].page_size
+            scores = self._fused_scores.get(
+                layer_name, (batch, pages), descriptors.device
+            )
+            self._fused_decode[layer_name] = NGCFusedDecodeState(
+                items,
+                descriptors,
+                workspace,
+                due_buffer.gpu[:batch],
+                score_buffer=scores,
+            )
+
+    def fused_graph_inputs(self) -> dict:
+        """Dependencies whose addresses and launch shapes must survive replay."""
+        return {
+            "layers": {
+                name: (
+                    state.descriptors,
+                    state.workspace.key_positions,
+                    state.inputs[0].block_table,
+                    state.due,
+                    state.score_buffer,
+                    self._rings[name],
+                    self._capture_groups[self._capture_layer_groups[name]].gpu,
+                    self._capture_active[self._capture_layer_groups[name]],
+                    state.inputs[0].page_size,
+                )
+                for name, state in self._fused_decode.items()
+            },
+            "scratch": self._fused_scratch.buffers.copy(),
+        }
+
+    def fused_graph_ready(self) -> bool:
+        return bool(self._fused_decode) and all(
+            state.scores is not None for state in self._fused_decode.values()
+        )
+
+    def publish_fused_graph_scores(self) -> None:
+        for state in self._fused_decode.values():
+            assert state.score_buffer is not None
+            state.scores = state.score_buffer
+
+    def fused_decode(
+        self,
+        layer_name: str,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        output: torch.Tensor,
+        softmax_scale: float,
+        num_segments: int = 16,
+        tile_size: int = 16,
+    ) -> bool:
+        state = self._fused_decode.get(layer_name)
+        if state is None:
+            return False
+        from vllm.v1.attention.ops.triton_ngc_decode import ngc_decode_and_score
+
+        count = len(state.inputs)
+        max_kept = state.workspace.key_positions.shape[1]
+        page_size = state.inputs[0].page_size
+        scores = self._fused_scores.get(
+            layer_name, (count, (max_kept + page_size - 1) // page_size), query.device
+        )
+        state.scores = ngc_decode_and_score(
+            query[:count],
+            kv_cache,
+            self._rings[layer_name],
+            state.descriptors,
+            state.workspace.key_positions,
+            state.inputs[0].block_table,
+            state.due,
+            output[:count],
+            window=self._windows[layer_name],
+            ring_window=self._window,
+            page_size=state.inputs[0].page_size,
+            max_kept=max_kept,
+            softmax_scale=softmax_scale,
+            num_segments=num_segments,
+            tile_size=tile_size,
+            scratch=self._fused_scratch,
+            score_buffer=scores,
+        )
+        return True
+
+    def get_fused_scores(self, req_id: str, layer_name: str) -> torch.Tensor | None:
+        state = self._fused_decode.get(layer_name)
+        if state is None or state.scores is None:
+            return None
+        for index, item in enumerate(state.inputs):
+            if item.req_id == req_id:
+                pages = (item.retained_tokens + item.page_size - 1) // item.page_size
+                return state.scores[index, :pages]
+        return None
 
     def _copy_handoff(self, tensors: list[torch.Tensor]) -> list[torch.Tensor]:
         """Pack on-device, transfer once, and wait before exposing CPU views."""
@@ -526,7 +738,7 @@ class NGCScoringBuffers:
                     table_version=version,
                     group_id=decision.group_id,
                     cadence_boundary=decision.cadence_boundary,
-                    computed_generated_tokens=decision.computed_generated_tokens,
+                    computed_tokens=decision.computed_tokens,
                     retained_tokens=decision.retained_tokens,
                     page_size=decision.page_size,
                     block_ids=block_ids,
@@ -549,12 +761,20 @@ class NGCScoringBuffers:
         positions = positions.to(ring.device)
         return ring.index_select(0, rows.to(ring.device)), positions
 
-    def any_due(self, req_id: str, computed_generated_tokens: int, cadence: int):
+    def any_due(
+        self,
+        req_id: str,
+        computed_tokens: int,
+        cadence: int,
+        *,
+        mark_checked: bool = True,
+    ):
         """Cheap per-request filter before checking each layer's boundary."""
-        boundary = computed_generated_tokens // cadence * cadence
+        boundary = computed_tokens // cadence * cadence
         if boundary <= self._checked_boundaries.get((req_id, cadence), 0):
             return False
-        self._checked_boundaries[req_id, cadence] = boundary
+        if mark_checked:
+            self._checked_boundaries[req_id, cadence] = boundary
         return True
 
     def store_page_scores(
@@ -574,17 +794,17 @@ class NGCScoringBuffers:
         history.decision = None
 
     def due_boundary(
-        self, req_id: str, layer_name: str, computed_generated_tokens: int, cadence: int
+        self, req_id: str, layer_name: str, computed_tokens: int, cadence: int
     ) -> int | None:
         """Coalesce crossed cadence boundaries; replay never repeats an event.
 
-        Only committed generated tokens with computed KV count. Prompt tokens
-        do not count. Advancing several intervals in one forward scores the
+        Prompt and generated tokens with computed KV both count. Eviction does
+        not reset the clock. Advancing several intervals in one forward scores the
         latest state once, rather than pretending to score earlier snapshots.
         """
-        if cadence <= 0 or computed_generated_tokens < 0:
-            raise ValueError("Invalid NGC cadence or computed generated-token count")
-        boundary = computed_generated_tokens // cadence * cadence
+        if cadence <= 0 or computed_tokens < 0:
+            raise ValueError("Invalid NGC cadence or computed-token count")
+        boundary = computed_tokens // cadence * cadence
         if boundary <= self._scored_boundaries.get((req_id, layer_name), 0):
             return None
         return boundary
@@ -595,7 +815,7 @@ class NGCScoringBuffers:
         layer_name: str,
         *,
         group_id: int,
-        computed_generated_tokens: int,
+        computed_tokens: int,
         cadence: int,
         eviction_rate: float,
         min_retained_tokens: int,
@@ -608,6 +828,7 @@ class NGCScoringBuffers:
         score_fn: Callable | None = None,
         reduce_scores: Callable[[torch.Tensor], torch.Tensor] | None = None,
         prepared: NGCPreparedScoreInput | None = None,
+        precomputed_scores: torch.Tensor | None = None,
     ) -> NGCEvictionDecision | None:
         """Score retained keys and save a proposal at the next due boundary.
 
@@ -616,32 +837,32 @@ class NGCScoringBuffers:
         positions. The optional reducer must sum scores across query-head shards
         before ranking. No cache data, block tables, or ownership is changed.
         """
-        boundary = self.due_boundary(
-            req_id, layer_name, computed_generated_tokens, cadence
-        )
+        boundary = self.due_boundary(req_id, layer_name, computed_tokens, cadence)
         if boundary is None:
             return None
         if self._seq_lens.get(req_id, 0) == 0:
             return None
-        if score_fn is None:
-            from vllm.v1.attention.ops.triton_ngc_scorer import ngc_page_scores
-
-            score_fn = ngc_page_scores
-        if prepared is None:
-            queries, query_positions = self.get_queries(req_id, layer_name)
-        else:
-            queries, query_positions = prepared.queries, prepared.query_positions
         retained_tokens = key_positions.numel()
-        scores = score_fn(
-            queries,
-            key_cache,
-            kernel_block_table,
-            retained_tokens,
-            softmax_scale,
-            scoring_block_size=page_size,
-            query_positions=query_positions,
-            key_positions=key_positions,
-        )
+        scores = precomputed_scores
+        if scores is None:
+            if score_fn is None:
+                from vllm.v1.attention.ops.triton_ngc_scorer import ngc_page_scores
+
+                score_fn = ngc_page_scores
+            if prepared is None:
+                queries, query_positions = self.get_queries(req_id, layer_name)
+            else:
+                queries, query_positions = prepared.queries, prepared.query_positions
+            scores = score_fn(
+                queries,
+                key_cache,
+                kernel_block_table,
+                retained_tokens,
+                softmax_scale,
+                scoring_block_size=page_size,
+                query_positions=query_positions,
+                key_positions=key_positions,
+            )
         if reduce_scores is not None:
             scores = reduce_scores(scores)
         if block_ids.device != scores.device:
@@ -660,7 +881,7 @@ class NGCScoringBuffers:
         decision = NGCEvictionDecision(
             group_id=group_id,
             cadence_boundary=boundary,
-            computed_generated_tokens=computed_generated_tokens,
+            computed_tokens=computed_tokens,
             retained_tokens=retained_tokens,
             page_size=page_size,
             page_scores=history.page_scores,

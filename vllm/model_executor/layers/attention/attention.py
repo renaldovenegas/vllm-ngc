@@ -280,6 +280,7 @@ class Attention(nn.Module, AttentionLayerBase):
         self.ngc_softmax_scale = scale
         # Set by the model runner; records queries with persistent buffers only.
         self.ngc_query_capture: Callable[[torch.Tensor], None] | None = None
+        self.ngc_fused_decode: Callable[..., bool] | None = None
 
         vllm_config = get_current_vllm_config()
         if cache_config is not None:

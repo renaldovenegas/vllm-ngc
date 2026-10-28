@@ -49,7 +49,7 @@ class NGCEvictionProposal:
     group_id: int
     table_version: int
     cadence_boundary: int
-    computed_generated_tokens: int
+    computed_tokens: int
     retained_tokens: int
     page_size: int
     # Optional diagnostics; versions and victim IDs validate compact proposals.
@@ -93,7 +93,6 @@ class NGCEvictionInbox:
         block_ids: list[int],
         page_size: int,
         computed_tokens: int,
-        prompt_tokens: int,
         in_flight_tokens: int,
         evicted_tokens: int = 0,
     ) -> bool:
@@ -108,8 +107,8 @@ class NGCEvictionInbox:
             or p.layer_name != layer_name
             or p.page_size != page_size
             or p.retained_tokens != computed_tokens - evicted_tokens
-            or p.computed_generated_tokens != max(computed_tokens - prompt_tokens, 0)
-            or not 0 < p.cadence_boundary <= p.computed_generated_tokens
+            or p.computed_tokens != computed_tokens
+            or not 0 < p.cadence_boundary <= p.computed_tokens
             or len(block_ids) < num_pages
             or (p.block_ids is not None and p.block_ids != tuple(block_ids[:num_pages]))
             or (

@@ -2461,7 +2461,7 @@ def test_ngc_layers_get_independent_groups_with_identical_specs(include_full):
         group_id=gid,
         table_version=1,
         cadence_boundary=64,
-        computed_generated_tokens=65,
+        computed_tokens=65,
         retained_tokens=65,
         page_size=16,
         block_ids=tuple(before[gid]),

@@ -770,13 +770,24 @@ class NGCEvictionManager(SingleTypeKVCacheManager):
     def apply_eviction(
         self, proposal: NGCEvictionProposal, computed_tokens: int
     ) -> bool:
+        removed = self.detach_eviction_blocks(proposal, computed_tokens)
+        if removed is None:
+            return False
+        if removed:
+            self.block_pool.free_blocks(removed)
+        return True
+
+    def detach_eviction_blocks(
+        self, proposal: NGCEvictionProposal, computed_tokens: int
+    ) -> list[KVCacheBlock] | None:
+        """Validate and compact a proposal; the caller must release returned blocks."""
         request_id = proposal.request_id
         layout = self.layouts.get(request_id)
         blocks = self.req_to_blocks.get(request_id, [])
         spec = self.kv_cache_spec
         assert isinstance(spec, NGCEvictionSpec)
         if layout is None:
-            return False
+            return None
         retained = computed_tokens - layout.evicted_tokens
         num_pages = cdiv(retained, self.block_size)
         victims = set(proposal.victim_indices)
@@ -797,21 +808,20 @@ class NGCEvictionManager(SingleTypeKVCacheManager):
                 max((retained - spec.min_retained_tokens) // self.block_size, 0),
             )
         ):
-            return False
+            return None
         removed = [blocks[i] for i in proposal.victim_indices]
         if tuple(b.block_id for b in removed) != proposal.victim_block_ids or any(
             b.is_null or b.ref_cnt != 1 for b in removed
         ):
-            return False
+            return None
         if not victims:
-            return True
+            return []
         self.req_to_blocks[request_id] = [
             block for i, block in enumerate(blocks) if i not in victims
         ]
         layout.evict(proposal.victim_indices, self.block_size)
-        self.block_pool.free_blocks(removed)
         self.changed_requests.add(request_id)
-        return True
+        return removed
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         self.layouts.pop(request_id, None)

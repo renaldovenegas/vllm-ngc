@@ -150,7 +150,12 @@ if BEFORE_DIR:
     single_use_containers=True,
 )
 def run_tests(
-    job: str, selector: str, model: str, revision: str, batch_size: int = 50
+    job: str,
+    selector: str,
+    model: str,
+    revision: str,
+    batch_size: int = 50,
+    repeats: int = 1,
 ) -> dict:
     source_hash = hashlib.sha256()
     for path in sorted(Path("/ngc-source").rglob("*")):
@@ -162,10 +167,12 @@ def run_tests(
         "speed-batch",
         "speed-batch-graph",
         "profile-batch-graph",
+        "profile-4k",
         "profile-scheduler",
         "graph-baseline",
         "scheduler-ab",
         "speed-eviction",
+        "speed-4k",
     }:
         # Snapshot the pristine base commit, with its compiled extensions,
         # before this checkout's source is overlaid.
@@ -189,6 +196,15 @@ def run_tests(
         shutil.copyfile(
             before_manager,
             BEFORE_ROOT / "vllm/v1/core/single_type_kv_cache_manager.py",
+        )
+        shutil.copyfile(
+            "/ngc-source/benchmark.py", BEFORE_ROOT / "ngc_modal_benchmark.py"
+        )
+        os.environ["NGC_BEFORE_ROOT"] = str(BEFORE_ROOT)
+    if job == "metadata-ab":
+        shutil.copytree(REMOTE_ROOT / "vllm", BEFORE_ROOT / "vllm")
+        shutil.copytree(
+            "/ngc-source/batched_before/vllm", BEFORE_ROOT / "vllm", dirs_exist_ok=True
         )
         shutil.copyfile(
             "/ngc-source/benchmark.py", BEFORE_ROOT / "ngc_modal_benchmark.py"
@@ -241,6 +257,8 @@ def run_tests(
         str(result_dir),
         "--batch-size",
         str(batch_size),
+        "--repeats",
+        str(repeats),
     ]
     try:
         with (result_dir / "output.log").open("w") as log:
@@ -262,8 +280,11 @@ def run_tests(
         metadata = {
             "run_id": run_id,
             "job": job,
-            "batch_size": batch_size if job == "speed-eviction" else None,
+            "batch_size": batch_size
+            if job in {"speed-eviction", "speed-4k", "metadata-ab", "profile-4k"}
+            else None,
             "gpu": GPU,
+            "repeats": repeats if job in {"metadata-ab", "speed-4k"} else None,
             "base_commit": BASE_COMMIT,
             "checkout_commit": revision,
             "source_sha256": source_hash.hexdigest(),
@@ -290,11 +311,19 @@ def main(
     output_dir: str = ".ngc-modal-results",
     submit_only: bool = False,
     batch_size: int = 50,
+    repeats: int = 1,
 ):
+    if repeats <= 0 or (repeats != 1 and job not in {"metadata-ab", "speed-4k"}):
+        raise ValueError("positive --repeats applies only to metadata-ab and speed-4k")
     if batch_size <= 0:
         raise ValueError("batch-size must be positive")
-    if job != "speed-eviction" and batch_size != 50:
-        raise ValueError("--batch-size currently applies only to speed-eviction")
+    if (
+        job not in {"speed-eviction", "speed-4k", "metadata-ab", "profile-4k"}
+        and batch_size != 50
+    ):
+        raise ValueError(
+            "--batch-size applies only to speed-eviction, speed-4k and metadata-ab"
+        )
     if job not in {
         "kernels",
         "metadata",
@@ -302,6 +331,7 @@ def main(
         "check",
         "story-ngc",
         "story-full",
+        "output-sweep",
         "zero-equivalence",
         "speed",
         "profile",
@@ -314,24 +344,27 @@ def main(
         "zero-equivalence-graph",
         "speed-batch-graph",
         "profile-batch-graph",
+        "profile-4k",
         "profile-scheduler",
         "bookkeeping-ab",
         "scheduler-ab",
+        "metadata-ab",
         "speed-eviction",
+        "speed-4k",
         "validate-inputs",
     }:
         raise ValueError("Unknown job")
     revision = check_checkout()
     if job == "bookkeeping-ab" and not BEFORE_MANAGER:
         raise ValueError("bookkeeping-ab needs NGC_MODAL_BEFORE_MANAGER")
-    if job == "scheduler-ab" and not BEFORE_DIR:
-        raise ValueError("scheduler-ab needs NGC_MODAL_BEFORE_DIR")
+    if job in {"scheduler-ab", "metadata-ab"} and not BEFORE_DIR:
+        raise ValueError(f"{job} needs NGC_MODAL_BEFORE_DIR")
     if submit_only:
-        call = run_tests.spawn(job, selector, model, revision, batch_size)
+        call = run_tests.spawn(job, selector, model, revision, batch_size, repeats)
         print(f"Submitted function call: {call.object_id}")
         print("Results will persist in vllm-ngc-test-cache under results/.")
         return
-    result = run_tests.remote(job, selector, model, revision, batch_size)
+    result = run_tests.remote(job, selector, model, revision, batch_size, repeats)
     target = Path(output_dir) / result["metadata"]["run_id"]
     target.mkdir(parents=True, exist_ok=True)
     for name, contents in result["files"].items():

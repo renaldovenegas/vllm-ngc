@@ -107,8 +107,8 @@ def summarize_steps(runs: list[list[dict]], cadence: int) -> list[dict]:
                 "retained_mean": first["retained_mean"],
                 "retained_min": first["retained_min"],
                 "retained_max": first["retained_max"],
-                "scoring_step": previous is not None
-                and generated // cadence > previous["generated"] // cadence,
+                "scoring_step": first["context_tokens"] // cadence
+                > (previous["context_tokens"] // cadence if previous else 0),
                 "eviction_step": previous is not None
                 and first["evicted_tokens_total"] > previous["evicted"],
                 "core_ms": statistics.median(row["core_ms"] for row in rows),
@@ -116,7 +116,10 @@ def summarize_steps(runs: list[list[dict]], cadence: int) -> list[dict]:
                 "core_ms_runs": [row["core_ms"] for row in rows],
             }
         )
-        previous = {"generated": generated, "evicted": first["evicted_tokens_total"]}
+        previous = {
+            "context_tokens": first["context_tokens"],
+            "evicted": first["evicted_tokens_total"],
+        }
     return steps
 
 
@@ -126,11 +129,16 @@ def run_case(
     output: Path,
     *,
     profiling: bool = False,
+    profile_only: bool = False,
     scheduler_profiling: bool = False,
     step_trace: bool = False,
     num_seqs: int = 1,
     output_tokens: int = 2048,
     warmup_tokens: int = 2048,
+    prompt_tokens: int = 0,
+    cadence: int = 128,
+    query_window: int = 5,
+    repeats: int = 3,
 ) -> None:
     import torch
 
@@ -159,9 +167,9 @@ def run_case(
             raise RuntimeError(f"Cannot identify decoder layer in {prefix!r}")
         if rate is not None:
             bound.arguments["ngc_eviction_config"] = NGCEvictionConfig(
-                cadence=128,
+                cadence=cadence,
                 eviction_rate=rate,
-                query_buffer_size=5,
+                query_buffer_size=query_window,
                 min_retained_tokens=32,
             )
             layers.append(prefix)
@@ -180,7 +188,9 @@ def run_case(
             tensor_parallel_size=1,
             attention_config={"backend": "TRITON_ATTN"},
             block_size=16,
-            max_model_len=max(4096, output_tokens + 1024),
+            max_model_len=max(
+                4096, max(output_tokens, warmup_tokens) + max(prompt_tokens, 1024)
+            ),
             max_num_seqs=num_seqs,
             max_num_batched_tokens=1024,
             gpu_memory_utilization=0.65,
@@ -200,6 +210,26 @@ def run_case(
         add_generation_prompt=True,
     )
     token_ids = tokenizer.encode(rendered, add_special_tokens=False)
+    if prompt_tokens:
+        before, after = rendered.split(prompt, 1)
+        prefix = tokenizer.encode(before, add_special_tokens=False)
+        suffix = tokenizer.encode("\n\n" + prompt + after, add_special_tokens=False)
+        background = tokenizer.encode(
+            "The kingdom of Aster lies between a mountain range and the sea. "
+            "Its northern villages guard an ancient forest, while ships bring "
+            "travelers to the southern ports. A young mapmaker discovers that "
+            "the stars on an old chart describe a hidden road through the mountains. "
+            "Use these setting notes as background for the story.\n",
+            add_special_tokens=False,
+        )
+        remaining = prompt_tokens - len(prefix) - len(suffix)
+        if remaining <= 0 or not background:
+            raise ValueError("Prompt token budget is too small for the chat template")
+        context = (background * ((remaining + len(background) - 1) // len(background)))[
+            :remaining
+        ]
+        token_ids = prefix + context + suffix
+        assert len(token_ids) == prompt_tokens
     assert token_ids and all(isinstance(token, int) for token in token_ids)
     sampling = dict(
         temperature=0.6,
@@ -238,25 +268,47 @@ def run_case(
         warmup = generate(warmup_tokens)
         torch.accelerator.synchronize()
     else:
-        original_evict = NGCEvictionManager.apply_eviction
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+        batched = hasattr(NGCEvictionManager, "detach_eviction_blocks")
+        eviction_method = "detach_eviction_blocks" if batched else "apply_eviction"
+        original_evict = getattr(NGCEvictionManager, eviction_method)
+        original_batch = getattr(KVCacheManager, "apply_ngc_evictions", None)
 
         @functools.wraps(original_evict)
         def validate_eviction(self, proposal, computed_tokens):
             before = self.block_pool.get_num_free_blocks()
-            applied = original_evict(self, proposal, computed_tokens)
+            result = original_evict(self, proposal, computed_tokens)
+            applied = result is not None if batched else result
             if applied:
-                assert self.block_pool.get_num_free_blocks() - before == len(
-                    proposal.victim_indices
+                freed = (
+                    len(result)
+                    if batched
+                    else (self.block_pool.get_num_free_blocks() - before)
                 )
-                warmup_events.append(len(proposal.victim_indices))
-            return applied
+                assert freed == len(proposal.victim_indices)
+                warmup_events.append(freed)
+            return result
 
-        NGCEvictionManager.apply_eviction = validate_eviction
+        def validate_batch(self, requests, proposals):
+            before = self.coordinator.block_pool.get_num_free_blocks()
+            start = len(warmup_events)
+            result = original_batch(self, requests, proposals)
+            assert self.coordinator.block_pool.get_num_free_blocks() - before == sum(
+                warmup_events[start:]
+            )
+            return result
+
+        setattr(NGCEvictionManager, eviction_method, validate_eviction)
+        if batched:
+            KVCacheManager.apply_ngc_evictions = validate_batch
         try:
             warmup = generate(warmup_tokens)
             torch.accelerator.synchronize()
         finally:
-            NGCEvictionManager.apply_eviction = original_evict
+            setattr(NGCEvictionManager, eviction_method, original_evict)
+            if batched:
+                KVCacheManager.apply_ngc_evictions = original_batch
     assert len(warmup[0].outputs[0].token_ids) == warmup_tokens
     if rate is not None and rate > 0:
         assert sum(warmup_events) > 0, "Warmup must exercise real eviction"
@@ -278,7 +330,7 @@ def run_case(
     seconds = []
     output_hashes = []
     step_runs: list[list[dict]] = []
-    for repeat in range(3):
+    for repeat in range(0 if profile_only else repeats):
         rows: list[dict] = []
         tracing = (
             trace_steps(llm, rows, upstream) if step_trace else contextlib.nullcontext()
@@ -298,7 +350,7 @@ def run_case(
         print(
             f"TIMING {case} repeat={repeat + 1} seconds={seconds[-1]:.6f}", flush=True
         )
-    median = statistics.median(seconds)
+    median = statistics.median(seconds) if seconds else None
     report = {
         "model": model,
         "case": case,
@@ -311,6 +363,8 @@ def run_case(
             for filename in (
                 "v1/core/kv_cache_coordinator.py",
                 "v1/core/single_type_kv_cache_manager.py",
+                "v1/core/kv_cache_manager.py",
+                "v1/core/sched/scheduler.py",
                 "v1/worker/gpu_model_runner.py",
                 "v1/attention/backends/triton_attn.py",
                 "v1/attention/ops/triton_ngc_inputs.py",
@@ -332,24 +386,25 @@ def run_case(
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "ngc_layers": layers,
-        "cadence": 128,
-        "query_buffer_size": 5,
+        "cadence": cadence,
+        "query_buffer_size": query_window,
         "min_retained_tokens": 32,
         "batch_size": num_seqs,
         "prompt_token_ids": token_ids,
+        "prompt_tokens": len(token_ids),
         "sampling": sampling,
         "output_tokens": output_tokens,
         "warmup_tokens": warmup_tokens,
         "seconds": seconds,
         "median_seconds": median,
-        "tokens_per_second": num_seqs * output_tokens / median,
+        "tokens_per_second": num_seqs * output_tokens / median if median else None,
         "model_load_seconds": load_seconds,
         "warmup_eviction_decisions": len(warmup_events),
         "warmup_freed_pages": sum(warmup_events),
         "jit_events_after_warmup": jit_events,
     }
     if step_trace:
-        report["steps"] = summarize_steps(step_runs, cadence=128)
+        report["steps"] = summarize_steps(step_runs, cadence=cadence)
     if scheduler_profiling:
         output.write_text(json.dumps(report, indent=2))
         report["scheduler_profile"] = profile_scheduler(llm, generate)
@@ -357,7 +412,9 @@ def run_case(
         print(f"JIT_TIMED_SUMMARY {case} events={len(jit_events)}", flush=True)
         output.write_text(json.dumps(report, indent=2))
         phase = "profile"
-        report["profile"] = profile_generation(llm, generate, output, upstream=upstream)
+        report["profile"] = (
+            profile_generation_4k if profile_only else profile_generation
+        )(llm, generate, output, upstream=upstream)
         jit_monitor._handle_jit_event = original_jit_event
     output.write_text(json.dumps(report, indent=2))
 
@@ -447,7 +504,9 @@ def profile_scheduler(llm, generate) -> dict:
                 for name in (
                     "allocate_slots",
                     "take_ngc_cache_updates",
-                    "apply_ngc_eviction",
+                    "apply_ngc_evictions"
+                    if hasattr(manager, "apply_ngc_evictions")
+                    else "apply_ngc_eviction",
                     "get_num_common_prefix_blocks",
                     "get_block_ids",
                     "take_new_block_ids",
@@ -536,8 +595,28 @@ def summarize_profile_trace(trace: Path) -> dict:
         if category in {"kernel", "gpu_memcpy", "gpu_memset"}:
             labels.append("gpu_busy")
             labels.append("gpu_kernels" if category == "kernel" else "gpu_copies_fills")
-        if category in {"cuda_runtime", "cuda_driver"} and "Synchronize" in name:
-            labels.append("host_sync_api")
+            if category == "kernel":
+                group = (
+                    "fused_partials"
+                    if "_ngc_decode_score_partials" in name
+                    else "fused_reduce"
+                    if "_ngc_decode_score_reduce" in name
+                    else "ordinary_attention"
+                    if "unified_attention" in name or "reduce_segments" in name
+                    else "input_preparation"
+                    if "prepare_ngc" in name or "capture_ngc" in name
+                    else "other_kernels"
+                )
+                labels.append("gpu_" + group)
+        if category in {"cuda_runtime", "cuda_driver"}:
+            if "Synchronize" in name:
+                labels.append("host_sync_api")
+            if "Memcpy" in name:
+                labels.append("host_copy_api")
+            if "GraphLaunch" in name:
+                labels.append("host_graph_launch_api")
+            if "Capture" in name or "GraphInstantiate" in name:
+                labels.append("host_graph_setup_api")
         if category == "user_annotation" and name.startswith(
             ("worker.", "scheduler.", "NGC.")
         ):
@@ -570,7 +649,11 @@ def summarize_profile_trace(trace: Path) -> dict:
         row = {label + "_ms": duration(label, start, end) for label in merged}
         row.update(step=name, wall_ms=(end - start) / 1000)
         row["gpu_idle_ms"] = row["wall_ms"] - row.get("gpu_busy_ms", 0.0)
-        row["scoring_boundary"] = row.get("NGC.select_victims_ms", 0.0) > 0
+        row["scoring_boundary"] = (
+            row.get("NGC.select_victims_ms", 0.0) > 0
+            or row.get("NGC.boundary_graph_ms", 0.0) > 0
+        )
+        row["proposal_application"] = row.get("NGC.apply_evictions_ms", 0.0) > 0
         rows.append(row)
     assert rows and "gpu_busy" in merged, "Missing CPU steps or CUDA kernel events"
     summaries = {}
@@ -588,7 +671,13 @@ def summarize_profile_trace(trace: Path) -> dict:
                 if key.endswith("_ms") and selected
             },
         }
+    window_start = min(step[1] for step in steps)
+    window_end = max(step[2] for step in steps)
     return {
+        "window_totals_ms": {
+            label: duration(label, window_start, window_end) for label in merged
+        },
+        "host_window_ms": (window_end - window_start) / 1000,
         "summary": summaries,
         "steps": rows,
         "note": "GPU busy is the union of kernels/copies/fills across streams. "
@@ -641,7 +730,12 @@ def profile_generation(llm, generate, output: Path, *, upstream: bool = False) -
         annotate(ngc_scoring.NGCScoringBuffers, "score_if_due", "NGC.score_if_due")
         annotate(ngc_scoring.NGCScoringBuffers, "_copy_handoff", "NGC.proposal_to_cpu")
         annotate(ngc_scoring, "select_ngc_victims", "NGC.select_victims")
-        annotate(NGCEvictionManager, "apply_eviction", "NGC.apply_eviction")
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+        if hasattr(KVCacheManager, "apply_ngc_evictions"):
+            annotate(KVCacheManager, "apply_ngc_evictions", "NGC.apply_evictions")
+        else:
+            annotate(NGCEvictionManager, "apply_eviction", "NGC.apply_eviction")
         annotate(GPUModelRunner, "_score_ngc_pages", "NGC.score_pages")
     annotate(Scheduler, "schedule", "scheduler.schedule")
     annotate(Scheduler, "update_from_output", "scheduler.update_from_output")
@@ -714,6 +808,278 @@ def profile_generation(llm, generate, output: Path, *, upstream: bool = False) -
     }
 
 
+def profile_generation_4k(llm, generate, output: Path, *, upstream: bool) -> dict:
+    """Profile a bounded late-decode window selected by actual generated KV."""
+    import threading
+
+    import torch
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    engine = llm.llm_engine
+    scheduler = engine.engine_core.engine_core.scheduler
+    patches, rows, averages = [], [], []
+    stacks = threading.local()
+    active_row = None
+    graph_counts = {"captures": 0, "replays": 0}
+    original_step = engine.step
+    trace = output.with_suffix(".trace.json")
+    started = False
+    stopped = False
+    profiled_steps = 0
+    warmup_steps, active_steps, start_generated = 8, 128, 3000
+
+    def annotate(owner, name, label, graph=False):
+        if not hasattr(owner, name):
+            return
+        original = getattr(owner, name)
+
+        @functools.wraps(original)
+        def wrapped(*args, **kwargs):
+            nonlocal active_row
+            row = active_row
+            previous_counts = None
+            if graph:
+                previous_counts = (args[0].captures, args[0].replays)
+            if row is None:
+                result = original(*args, **kwargs)
+            else:
+                stack = getattr(stacks, "frames", None)
+                if stack is None:
+                    stack = stacks.frames = []
+                frame = [0, 0]
+                wall_start, cpu_start = time.perf_counter_ns(), time.thread_time_ns()
+                stack.append(frame)
+                try:
+                    with torch.profiler.record_function(label):
+                        result = original(*args, **kwargs)
+                finally:
+                    wall = time.perf_counter_ns() - wall_start
+                    cpu = time.thread_time_ns() - cpu_start
+                    stack.pop()
+                    if stack:
+                        stack[-1][0] += wall
+                        stack[-1][1] += cpu
+                    values = row["operations"].setdefault(
+                        label,
+                        {
+                            "calls": 0,
+                            "wall_ms": 0.0,
+                            "thread_cpu_ms": 0.0,
+                            "exclusive_wall_ms": 0.0,
+                            "exclusive_thread_cpu_ms": 0.0,
+                        },
+                    )
+                    values["calls"] += 1
+                    for key, value in (
+                        ("wall_ms", wall),
+                        ("thread_cpu_ms", cpu),
+                        ("exclusive_wall_ms", wall - frame[0]),
+                        ("exclusive_thread_cpu_ms", cpu - frame[1]),
+                    ):
+                        values[key] += value / 1e6
+            if graph:
+                for index, key in enumerate(("captures", "replays")):
+                    delta = getattr(args[0], key) - previous_counts[index]
+                    graph_counts[key] += delta
+                    if row is not None:
+                        row["boundary_graph_" + key] += delta
+            return result
+
+        patches.append((owner, name, original))
+        setattr(owner, name, wrapped)
+
+    for owner, name, label in (
+        (Scheduler, "schedule", "scheduler.schedule"),
+        (Scheduler, "update_from_output", "scheduler.update_from_output"),
+        (GPUModelRunner, "_prepare_inputs", "worker.prepare_inputs"),
+        (GPUModelRunner, "_update_states", "worker.update_states"),
+        (GPUModelRunner, "_build_attention_metadata", "worker.attention_metadata"),
+        (GPUModelRunner, "_model_forward", "worker.model_forward"),
+    ):
+        annotate(owner, name, label)
+    if not upstream:
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        from vllm.v1.worker.ngc_cudagraph import NGCBoundaryGraph
+        from vllm.v1.worker.ngc_scoring import NGCScoringBuffers
+
+        for owner, name, label in (
+            (KVCacheManager, "apply_ngc_evictions", "NGC.apply_evictions"),
+            (GPUModelRunner, "_prepare_ngc_fused_decode", "NGC.prepare_fused_decode"),
+            (GPUModelRunner, "_prepare_ngc_evicted", "NGC.prepare_offsets"),
+            (GPUModelRunner, "_score_ngc_pages", "NGC.score_pages"),
+            (NGCScoringBuffers, "prepare_score_inputs", "NGC.prepare_score_inputs"),
+            (NGCScoringBuffers, "_copy_handoff", "NGC.proposal_to_cpu"),
+            (NGCScoringBuffers, "take_proposals", "NGC.take_proposals"),
+        ):
+            annotate(owner, name, label)
+        annotate(NGCBoundaryGraph, "run", "NGC.boundary_graph", graph=True)
+
+    def save_profile(prof):
+        prof.export_chrome_trace(str(trace))
+        for event in prof.key_averages():
+            averages.append(
+                dict(
+                    name=event.key,
+                    calls=event.count,
+                    self_cpu_us=event.self_cpu_time_total,
+                    cpu_us=event.cpu_time_total,
+                    self_device_us=event.self_device_time_total,
+                    device_us=event.device_time_total,
+                )
+            )
+
+    prof = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(
+            wait=0, warmup=warmup_steps, active=active_steps, repeat=1
+        ),
+        on_trace_ready=save_profile,
+        record_shapes=False,
+        with_stack=False,
+        profile_memory=False,
+    )
+
+    def generated():
+        request = next(iter(scheduler.requests.values()), None)
+        return (
+            (request.num_computed_tokens - request.num_prompt_tokens)
+            if request is not None
+            else -1
+        )
+
+    def step():
+        nonlocal started, stopped, profiled_steps, active_row
+        count = generated()
+        if not started and count >= start_generated:
+            torch.accelerator.synchronize()
+            prof.start()
+            started = True
+            print(f"PROFILE_START {output.stem} generated={count}", flush=True)
+        if started and not stopped:
+            row = None
+            if profiled_steps >= warmup_steps:
+                inbox = getattr(scheduler, "ngc_eviction_inbox", None)
+                row = dict(
+                    generated_before=count,
+                    operations={},
+                    pending_proposals=len(inbox.pending) if inbox else 0,
+                    boundary_graph_captures=0,
+                    boundary_graph_replays=0,
+                )
+                active_row = row
+            start_wall, start_cpu = time.perf_counter_ns(), time.thread_time_ns()
+            try:
+                result = original_step()
+            finally:
+                active_row = None
+            if row is not None:
+                row.update(
+                    generated_after=generated(),
+                    wall_ms=(time.perf_counter_ns() - start_wall) / 1e6,
+                    thread_cpu_ms=(time.thread_time_ns() - start_cpu) / 1e6,
+                )
+                row["kind"] = (
+                    "scoring_boundary"
+                    if row["boundary_graph_captures"] or row["boundary_graph_replays"]
+                    else "proposal_application"
+                    if row["pending_proposals"]
+                    else "ordinary"
+                )
+                rows.append(row)
+            prof.step()
+            profiled_steps += 1
+            if profiled_steps == warmup_steps + active_steps:
+                torch.accelerator.synchronize()
+                prof.stop()
+                stopped = True
+                print(f"PROFILE_END {output.stem} generated={generated()}", flush=True)
+            return result
+        return original_step()
+
+    try:
+        engine.step = step
+        result = generate()
+        assert all(len(item.outputs[0].token_ids) == 4096 for item in result)
+        assert stopped and len(rows) == active_steps
+        if not upstream:
+            assert any(row["kind"] == "scoring_boundary" for row in rows), (
+                "No scoring boundary captured"
+            )
+            assert any(row["kind"] == "proposal_application" for row in rows), (
+                "No proposal step captured"
+            )
+    finally:
+        if started and not stopped:
+            prof.stop()
+        engine.step = original_step
+        for owner, name, original in reversed(patches):
+            setattr(owner, name, original)
+    assert trace.exists() and averages
+    timeline = summarize_profile_trace(trace)
+    assert len(timeline["steps"]) == len(rows), (
+        "Host profiler steps differ from actual decode window"
+    )
+    for device_row, cpu_row in zip(timeline["steps"], rows):
+        device_row["kind"] = cpu_row["kind"]
+    timeline["summary"] = {}
+    for kind in ("ordinary", "scoring_boundary", "proposal_application"):
+        selected = [row for row in timeline["steps"] if row["kind"] == kind]
+        timeline["summary"][kind] = {
+            "steps": len(selected),
+            "mean_ms": {
+                key: statistics.mean(row[key] for row in selected)
+                for key in timeline["steps"][0]
+                if key.endswith("_ms") and selected
+            },
+        }
+    phase_summary = {}
+    for kind in ("ordinary", "scoring_boundary", "proposal_application"):
+        selected = [row for row in rows if row["kind"] == kind]
+        operations = {}
+        for row in selected:
+            for name, values in row["operations"].items():
+                total = operations.setdefault(name, {key: 0.0 for key in values})
+                for key, value in values.items():
+                    total[key] += value
+        phase_summary[kind] = dict(
+            steps=len(selected),
+            mean_wall_ms=statistics.mean(r["wall_ms"] for r in selected)
+            if selected
+            else None,
+            mean_thread_cpu_ms=statistics.mean(r["thread_cpu_ms"] for r in selected)
+            if selected
+            else None,
+            operations_totals=operations,
+        )
+    with trace.open("rb") as source, gzip.open(str(trace) + ".gz", "wb") as target:
+        shutil.copyfileobj(source, target)
+    trace.unlink()
+    return dict(
+        trace=trace.name + ".gz",
+        events=averages,
+        timeline=timeline,
+        generated_window=[rows[0]["generated_before"], rows[-1]["generated_after"]],
+        phases=phase_summary,
+        steps=rows,
+        boundary_graph_totals=graph_counts,
+        boundary_graph_window={
+            key: sum(r["boundary_graph_" + key] for r in rows) for key in graph_counts
+        },
+        note=(
+            "Profiler-only attribution, not standalone speed. CPU wall spans overlap "
+            "device work; thread CPU excludes waits. Exclusive timers subtract "
+            "directly nested instrumented calls on the same thread. Device "
+            "intervals clipped to host steps have asynchronous attribution limits; "
+            "use whole-window GPU interval unions for totals."
+        ),
+    )
+
+
 def compare_steps(reports: dict, cases: list[str], result_dir: Path) -> dict:
     """Relate decode-step latency to retained cache size for each case."""
     fields = [
@@ -782,10 +1148,15 @@ def sweep(
     result_dir: Path,
     *,
     profiling: bool = False,
+    profile_only: bool = False,
     scheduler_profiling: bool = False,
     cases: list[str] | None = None,
     output_tokens: int = 2048,
     warmup_tokens: int = 2048,
+    prompt_tokens: int = 0,
+    cadence: int = 128,
+    query_window: int = 5,
+    repeats: int = 3,
     step_trace: bool = False,
     num_seqs: int = 1,
 ) -> None:
@@ -848,8 +1219,17 @@ def sweep(
                 str(warmup_tokens),
                 "--num-seqs",
                 str(num_seqs),
+                "--prompt-tokens",
+                str(prompt_tokens),
+                "--cadence",
+                str(cadence),
+                "--query-window",
+                str(query_window),
+                "--repeats",
+                str(repeats),
             ]
             + (["--profile"] if profiling else [])
+            + (["--profile-only"] if profile_only else [])
             + (["--scheduler-profile"] if scheduler_profiling else [])
             + (["--step-trace"] if step_trace else []),
             check=True,
@@ -872,6 +1252,9 @@ def sweep(
         assert report["gpu"] == baseline["gpu"]
         assert report["sampling"] == baseline["sampling"]
         assert report["prompt_token_ids"] == baseline["prompt_token_ids"]
+        if profile_only:
+            rows.append({"case": case, "profile": report["profile"]["trace"]})
+            continue
         rows.append(
             {
                 "case": case,
@@ -900,6 +1283,15 @@ def sweep(
             == reports["0-graph"]["output_token_hashes"]
         )
         assert summary["before_after_output_hashes_match"]
+    for rate in ("0", "0.5"):
+        before_case, after_case = f"before-{rate}-graph", f"{rate}-graph"
+        if before_case in reports and after_case in reports:
+            match = (
+                reports[before_case]["output_token_hashes"]
+                == reports[after_case]["output_token_hashes"]
+            )
+            summary[f"before_after_{rate}_hashes_match"] = match
+            assert match, f"Output hashes differ for {rate}"
     if step_trace:
         summary["step_trace"] = compare_steps(reports, cases, result_dir)
         print(json.dumps(summary["step_trace"], indent=2), flush=True)
@@ -917,24 +1309,47 @@ if __name__ == "__main__":
     parser.add_argument("--result-dir", type=Path, required=True)
     parser.add_argument("--case")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-only", action="store_true")
     parser.add_argument("--scheduler-profile", action="store_true")
     parser.add_argument("--cases", nargs="+")
     parser.add_argument("--output-tokens", type=int, default=2048)
     parser.add_argument("--warmup-tokens", type=int, default=2048)
     parser.add_argument("--step-trace", action="store_true")
     parser.add_argument("--num-seqs", type=int, default=1)
+    parser.add_argument("--prompt-tokens", type=int, default=0)
+    parser.add_argument("--cadence", type=int, default=128)
+    parser.add_argument("--query-window", type=int, default=5)
+    parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
-    if (args.profile or args.scheduler_profile) and args.output_tokens != 2048:
+    if (
+        args.prompt_tokens < 0
+        or args.cadence <= 0
+        or args.query_window <= 0
+        or args.repeats <= 0
+    ):
+        parser.error(
+            "Prompt length must be nonnegative; cadence and query window positive"
+        )
+    if (
+        (args.profile or args.scheduler_profile)
+        and args.output_tokens != 2048
+        and not args.profile_only
+    ):
         parser.error("The profile window assumes 2048 output tokens")
     if args.case is None:
         sweep(
             args.model,
             args.result_dir,
             profiling=args.profile,
+            profile_only=args.profile_only,
             scheduler_profiling=args.scheduler_profile,
             cases=args.cases,
             output_tokens=args.output_tokens,
             warmup_tokens=args.warmup_tokens,
+            prompt_tokens=args.prompt_tokens,
+            cadence=args.cadence,
+            query_window=args.query_window,
+            repeats=args.repeats,
             step_trace=args.step_trace,
             num_seqs=args.num_seqs,
         )
@@ -944,9 +1359,14 @@ if __name__ == "__main__":
             args.case,
             args.result_dir / f"speed-{args.case}.json",
             profiling=args.profile,
+            profile_only=args.profile_only,
             scheduler_profiling=args.scheduler_profile,
             output_tokens=args.output_tokens,
             warmup_tokens=args.warmup_tokens,
+            prompt_tokens=args.prompt_tokens,
+            cadence=args.cadence,
+            query_window=args.query_window,
+            repeats=args.repeats,
             step_trace=args.step_trace,
             num_seqs=args.num_seqs,
         )

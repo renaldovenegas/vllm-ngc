@@ -48,25 +48,60 @@ def smoke(
     ngc_enabled: bool = True,
     equivalence: bool = False,
     graphs: bool = False,
+    eviction_rate: float = 0.25,
+    cadence: int = 128,
+    gpu_memory_utilization: float = 0.65,
 ) -> None:
     from vllm import LLM, SamplingParams
     from vllm.config.cache import NGCEvictionConfig
     from vllm.model_executor.layers.attention.attention import Attention
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.single_type_kv_cache_manager import NGCEvictionManager
     from vllm.v1.worker.ngc_scoring import NGCScoringBuffers
 
     original_init = Attention.__init__
     signature = inspect.signature(original_init)
-    original_evict = NGCEvictionManager.apply_eviction
+    batched = hasattr(NGCEvictionManager, "detach_eviction_blocks")
+    eviction_method = "detach_eviction_blocks" if batched else "apply_eviction"
+    original_evict = getattr(NGCEvictionManager, eviction_method)
+    original_batch = getattr(KVCacheManager, "apply_ngc_evictions", None)
     configured_layers = {"ngc": [], "full": []}
     events = []
     zero_decisions = []
     original_score = NGCScoringBuffers.score_if_due
+    original_fused = getattr(NGCScoringBuffers, "fused_decode", None)
+    try:
+        from vllm.v1.worker.ngc_cudagraph import NGCBoundaryGraph
+    except ModuleNotFoundError:
+        NGCBoundaryGraph = None
+    original_graph_run = NGCBoundaryGraph.run if NGCBoundaryGraph is not None else None
+    fused_counts = {
+        "supported": original_fused is not None,
+        "successful_calls": 0,
+        "precomputed_score_decisions": 0,
+        "boundary_graph_captures": 0,
+        "boundary_graph_replays": 0,
+    }
+
+    def record_graph_run(self, *args, **kwargs):
+        captures, replays = self.captures, self.replays
+        result = original_graph_run(self, *args, **kwargs)
+        fused_counts["boundary_graph_captures"] += self.captures - captures
+        fused_counts["boundary_graph_replays"] += self.replays - replays
+        return result
+
+    def record_fused(self, *args, **kwargs):
+        result = original_fused(self, *args, **kwargs)
+        if result:
+            fused_counts["successful_calls"] += 1
+        return result
 
     @functools.wraps(original_score)
     def record_score(self, req_id, layer_name, **kwargs):
         decision = original_score(self, req_id, layer_name, **kwargs)
-        if equivalence and decision is not None:
+        if decision is not None and kwargs.get("precomputed_scores") is not None:
+            fused_counts["precomputed_score_decisions"] += 1
+        if (equivalence or eviction_rate == 0) and decision is not None:
             assert decision.victim_indices.numel() == 0
             zero_decisions.append((req_id, layer_name, decision.cadence_boundary))
         return decision
@@ -80,8 +115,8 @@ def smoke(
         enabled = ngc_enabled
         if enabled:
             bound.arguments["ngc_eviction_config"] = NGCEvictionConfig(
-                cadence=128,
-                eviction_rate=0.0 if equivalence else 0.25,
+                cadence=cadence,
+                eviction_rate=0.0 if equivalence else eviction_rate,
                 query_buffer_size=5,
                 min_retained_tokens=32,
             )
@@ -91,13 +126,18 @@ def smoke(
     @functools.wraps(original_evict)
     def record_eviction(self, proposal, computed_tokens):
         before = self.block_pool.get_num_free_blocks()
-        applied = original_evict(self, proposal, computed_tokens)
+        result = original_evict(self, proposal, computed_tokens)
+        applied = result is not None if batched else result
         if equivalence:
             assert not proposal.victim_indices
             assert self.block_pool.get_num_free_blocks() == before
             assert self.layouts[proposal.request_id].evicted_tokens == 0
         if applied and proposal.victim_indices:
-            freed = self.block_pool.get_num_free_blocks() - before
+            freed = (
+                len(result)
+                if batched
+                else (self.block_pool.get_num_free_blocks() - before)
+            )
             assert freed == len(proposal.victim_indices)
             event = {
                 "request": proposal.request_id,
@@ -109,11 +149,26 @@ def smoke(
             events.append(event)
             with (result_dir / "evictions.jsonl").open("a") as output:
                 output.write(json.dumps(event) + "\n")
-        return applied
+        return result
+
+    def record_batch(self, requests, proposals):
+        before = self.coordinator.block_pool.get_num_free_blocks()
+        start = len(events)
+        result = original_batch(self, requests, proposals)
+        assert self.coordinator.block_pool.get_num_free_blocks() - before == sum(
+            event["freed_pages"] for event in events[start:]
+        )
+        return result
 
     Attention.__init__ = initialize_attention
-    NGCEvictionManager.apply_eviction = record_eviction
+    setattr(NGCEvictionManager, eviction_method, record_eviction)
+    if batched:
+        KVCacheManager.apply_ngc_evictions = record_batch
     NGCScoringBuffers.score_if_due = record_score
+    if original_fused is not None:
+        NGCScoringBuffers.fused_decode = record_fused
+    if original_graph_run is not None:
+        NGCBoundaryGraph.run = record_graph_run
     try:
         llm = LLM(
             model=model,
@@ -128,7 +183,7 @@ def smoke(
             max_model_len=8192 if story else 4096,
             max_num_seqs=2,
             max_num_batched_tokens=1024,
-            gpu_memory_utilization=0.65,
+            gpu_memory_utilization=gpu_memory_utilization,
             enable_prefix_caching=False,
             seed=0,
         )
@@ -192,30 +247,39 @@ def smoke(
                 (output.request_id, layer, boundary)
                 for output in outputs
                 for layer in configured_layers["ngc"]
-                for boundary in (128, 256, 384)
+                for boundary in range(
+                    cadence,
+                    len(output.prompt_token_ids) + len(output.outputs[0].token_ids),
+                    cadence,
+                )
             }
             observed = {
                 (req.rsplit("-", 1)[0], layer, boundary)
                 for req, layer, boundary in zero_decisions
             }
             assert observed == expected, (observed, expected)
+        elif ngc_enabled and eviction_rate == 0:
+            assert not events
+            assert zero_decisions, "Zero-rate NGC must still score cadence boundaries"
         elif ngc_enabled:
             assert len(cycles) == len(prompts) * len(configured_layers["ngc"])
             assert all(count >= 2 for count in cycles.values())
         else:
             assert not events, "Full attention must not evict"
         report = {
+            "fused_decode": fused_counts,
             "model": model,
             "attention_mode": "ngc_all_layers" if ngc_enabled else "full",
             "enforce_eager": not graphs,
+            "gpu_memory_utilization": gpu_memory_utilization,
             "chat_template_applied": story or equivalence,
             "zero_decisions": zero_decisions,
             "layers": configured_layers,
             "eviction_events": len(events),
             "sampling": sampling,
             "ngc": {
-                "cadence": 128,
-                "eviction_rate": 0.0 if equivalence else 0.25,
+                "cadence": cadence,
+                "eviction_rate": 0.0 if equivalence else eviction_rate,
                 "query_buffer_size": 5,
                 "min_retained_tokens": 32,
             }
@@ -244,11 +308,23 @@ def smoke(
         for index, output in enumerate(outputs):
             (result_dir / f"output-{index}.txt").write_text(output.outputs[0].text)
         (result_dir / "smoke.json").write_text(json.dumps(report, indent=2))
+        if graphs and ngc_enabled and equivalence and original_graph_run is not None:
+            assert fused_counts["boundary_graph_captures"] > 0
+            assert fused_counts["boundary_graph_replays"] > 0
         print(json.dumps(report, indent=2))
     finally:
+        (result_dir / "fused-instrumentation.json").write_text(
+            json.dumps(fused_counts, indent=2)
+        )
         Attention.__init__ = original_init
-        NGCEvictionManager.apply_eviction = original_evict
+        setattr(NGCEvictionManager, eviction_method, original_evict)
+        if batched:
+            KVCacheManager.apply_ngc_evictions = original_batch
         NGCScoringBuffers.score_if_due = original_score
+        if original_fused is not None:
+            NGCScoringBuffers.fused_decode = original_fused
+        if original_graph_run is not None:
+            NGCBoundaryGraph.run = original_graph_run
 
 
 def zero_equivalence(model: str, result_dir: Path, *, graphs: bool = False) -> None:
@@ -307,6 +383,38 @@ def zero_equivalence(model: str, result_dir: Path, *, graphs: bool = False) -> N
     assert result["passed"], "Zero-eviction equivalence failed; see equivalence.json"
 
 
+def output_sweep(model: str, result_dir: Path) -> None:
+    """Save matched story generations from isolated engines at four rates."""
+    reports = {}
+    for rate in (0.0, 0.25, 0.5, 0.75):
+        name = f"eviction-{int(rate * 100)}"
+        target = result_dir / name
+        target.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                sys.executable,
+                __file__,
+                "--job",
+                "output-case",
+                "--model",
+                model,
+                "--eviction-rate",
+                str(rate),
+                "--result-dir",
+                str(target),
+            ],
+            check=True,
+        )
+        reports[name] = json.loads((target / "smoke.json").read_text())
+        (result_dir / "outputs.json").write_text(json.dumps(reports, indent=2))
+        sections = [
+            f"=== {key} ===\n\n{report['outputs'][0]}"
+            for key, report in reports.items()
+        ]
+        (result_dir / "outputs.txt").write_text("\n\n".join(sections))
+        print(f"NGC_CHECKPOINT {target}", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -319,6 +427,8 @@ def main() -> None:
             "smoke-graph",
             "story-ngc",
             "story-full",
+            "output-sweep",
+            "output-case",
             "zero-equivalence",
             "zero-equivalence-graph",
             "zero-full",
@@ -330,12 +440,15 @@ def main() -> None:
             "speed-long",
             "speed-upstream",
             "scheduler-ab",
+            "metadata-ab",
             "speed-eviction",
+            "speed-4k",
             "validate-inputs",
             "step-trace",
             "speed-batch",
             "speed-batch-graph",
             "profile-batch-graph",
+            "profile-4k",
             "profile-scheduler",
             "bookkeeping-ab",
             "graph-baseline",
@@ -345,12 +458,25 @@ def main() -> None:
     parser.add_argument("--selector", default="ngc")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--batch-size", type=int, default=50)
+    parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--eviction-rate", type=float, default=0.25)
     parser.add_argument("--result-dir", type=Path, required=True)
     args = parser.parse_args()
+    if not 0 <= args.eviction_rate < 1:
+        parser.error("--eviction-rate must be in [0, 1)")
+    if args.repeats <= 0 or (
+        args.repeats != 1 and args.job not in {"metadata-ab", "speed-4k"}
+    ):
+        parser.error("positive --repeats applies only to metadata-ab and speed-4k")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
-    if args.job != "speed-eviction" and args.batch_size != 50:
-        parser.error("--batch-size currently applies only to speed-eviction")
+    if (
+        args.job not in {"speed-eviction", "speed-4k", "metadata-ab", "profile-4k"}
+        and args.batch_size != 50
+    ):
+        parser.error(
+            "--batch-size applies only to speed-eviction, speed-4k and metadata-ab"
+        )
     check_environment()
     if args.job == "validate-inputs":
         for job in ("zero-equivalence", "zero-equivalence-graph", "smoke-graph"):
@@ -401,11 +527,14 @@ def main() -> None:
         "speed-long",
         "speed-upstream",
         "scheduler-ab",
+        "metadata-ab",
         "speed-eviction",
+        "speed-4k",
         "step-trace",
         "speed-batch",
         "speed-batch-graph",
         "profile-batch-graph",
+        "profile-4k",
         "profile-scheduler",
         "bookkeeping-ab",
     }:
@@ -524,6 +653,55 @@ def main() -> None:
             + (bookkeeping_args if args.job == "bookkeeping-ab" else [])
             + (
                 [
+                    "--profile",
+                    "--profile-only",
+                    "--cases",
+                    "upstream-graph",
+                    "0-graph",
+                    "0.5-graph",
+                    "--num-seqs",
+                    str(args.batch_size),
+                    "--prompt-tokens",
+                    "4096",
+                    "--output-tokens",
+                    "4096",
+                    "--warmup-tokens",
+                    "768",
+                    "--cadence",
+                    "256",
+                    "--query-window",
+                    "5",
+                ]
+                if args.job == "profile-4k"
+                else []
+            )
+            + (
+                [
+                    "--cases",
+                    "before-0-graph",
+                    "0-graph",
+                    "before-0.5-graph",
+                    "0.5-graph",
+                    "--num-seqs",
+                    str(args.batch_size),
+                    "--prompt-tokens",
+                    "4096",
+                    "--output-tokens",
+                    "4096",
+                    "--warmup-tokens",
+                    "768",
+                    "--cadence",
+                    "256",
+                    "--query-window",
+                    "5",
+                    "--repeats",
+                    str(args.repeats),
+                ]
+                if args.job == "metadata-ab"
+                else []
+            )
+            + (
+                [
                     "--cases",
                     "upstream-graph",
                     "0-graph",
@@ -535,6 +713,31 @@ def main() -> None:
                     "384",
                 ]
                 if args.job == "speed-eviction"
+                else []
+            )
+            + (
+                [
+                    "--cases",
+                    "upstream-graph",
+                    "0-graph",
+                    "0.5-graph",
+                    "0.75-graph",
+                    "--num-seqs",
+                    str(args.batch_size),
+                    "--prompt-tokens",
+                    "4096",
+                    "--output-tokens",
+                    "4096",
+                    "--warmup-tokens",
+                    "768",
+                    "--cadence",
+                    "256",
+                    "--query-window",
+                    "5",
+                    "--repeats",
+                    str(args.repeats),
+                ]
+                if args.job == "speed-4k"
                 else []
             ),
             check=True,
@@ -564,6 +767,18 @@ def main() -> None:
         )
     elif args.job in {"smoke", "smoke-graph"}:
         smoke(args.model, args.result_dir, graphs=args.job == "smoke-graph")
+    elif args.job == "output-sweep":
+        output_sweep(args.model, args.result_dir)
+    elif args.job == "output-case":
+        smoke(
+            args.model,
+            args.result_dir,
+            story=True,
+            graphs=True,
+            eviction_rate=args.eviction_rate,
+            cadence=256,
+            gpu_memory_utilization=0.90,
+        )
     elif args.job in {"story-ngc", "story-full"}:
         smoke(
             args.model, args.result_dir, story=True, ngc_enabled=args.job == "story-ngc"

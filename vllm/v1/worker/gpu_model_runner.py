@@ -229,10 +229,12 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.ngc_cudagraph import NGCBoundaryGraph
 from vllm.v1.worker.ngc_scoring import (
     NGCPreparedScoreInput,
     NGCScoreInput,
     NGCScoringBuffers,
+    share_ngc_retained_lengths,
 )
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
@@ -259,6 +261,7 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
@@ -517,6 +520,7 @@ class GPUModelRunner(
     ):
         self.vllm_config = vllm_config
         self.ngc_scoring_buffers = NGCScoringBuffers()
+        self._ngc_boundary_graph = NGCBoundaryGraph()
         self._ngc_scoring_layers: list[tuple[int, Attention]] = []
         self._ngc_columns_checked = False
         # Last compacted layout per request and NGC group; absent means none.
@@ -2267,7 +2271,6 @@ class GPUModelRunner(
                 num_scheduled_tokens,
                 positions_np,
                 self.optimistic_seq_lens_cpu[:num_reqs].tolist(),
-                self.input_batch.num_prompt_tokens[:num_reqs],
             )
         for group_id, table in enumerate(self.input_batch.block_table.block_tables):
             if group_id in self._ngc_columns:
@@ -2595,7 +2598,9 @@ class GPUModelRunner(
         cached_attn_metadata: dict[
             tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
         ] = {}
-        ngc_metadata = None
+        ngc_metadata: dict[
+            tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
+        ] = {}
 
         def _build_attn_group_metadata(
             kv_cache_gid: int,
@@ -2603,7 +2608,6 @@ class GPUModelRunner(
             common_attn_metadata: CommonAttentionMetadata,
             ubid: int | None = None,
         ) -> None:
-            nonlocal ngc_metadata
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
@@ -2644,6 +2648,7 @@ class GPUModelRunner(
                         self.mamba_prev_last_scheduled_idx.gpu[:num_reqs_padded]
                     )
 
+            reuse_ngc_metadata = getattr(builder, "reuse_ngc_metadata", None)
             reuse_ngc = (
                 isinstance(kv_cache_spec, NGCEvictionSpec)
                 and not for_cudagraph_capture
@@ -2651,11 +2656,12 @@ class GPUModelRunner(
                 and cascade_attn_prefix_len == 0
                 and common_attn_metadata.mm_req_doc_ranges is None
                 and common_attn_metadata.rswa_prefix_lens is None
-                and hasattr(builder, "reuse_ngc_metadata")
+                and reuse_ngc_metadata is not None
             )
-            if reuse_ngc and ngc_metadata is not None:
-                attn_metadata_i = builder.reuse_ngc_metadata(
-                    ngc_metadata, common_attn_metadata
+            if reuse_ngc and cache_key in ngc_metadata:
+                assert reuse_ngc_metadata is not None
+                attn_metadata_i = reuse_ngc_metadata(
+                    ngc_metadata[cache_key], common_attn_metadata
                 )
             elif for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(
@@ -2679,8 +2685,8 @@ class GPUModelRunner(
                 )
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
-            if reuse_ngc and ngc_metadata is None:
-                ngc_metadata = attn_metadata_i
+            if reuse_ngc and cache_key not in ngc_metadata:
+                ngc_metadata[cache_key] = attn_metadata_i
 
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
@@ -2695,7 +2701,7 @@ class GPUModelRunner(
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
-        ngc_max_seq_lens = None
+        ngc_length_views = None
         if (
             self._ngc_columns
             and num_scheduled_tokens is not None
@@ -2703,7 +2709,9 @@ class GPUModelRunner(
         ):
             retained_buffer = self.input_batch.block_table.ngc_retained
             assert retained_buffer is not None
-            ngc_max_seq_lens = retained_buffer.np[:, :num_reqs_padded].max(axis=1)
+            ngc_length_views = share_ngc_retained_lengths(
+                retained_buffer, num_reqs_padded
+            )
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
 
@@ -2728,10 +2736,12 @@ class GPUModelRunner(
                 # CUDA graph replays see each step's compacted lengths.
                 retained_buffer = self.input_batch.block_table.ngc_retained
                 assert retained_buffer is not None
-                retained_gpu = retained_buffer.gpu[column, :num_reqs_padded]
-                retained = retained_buffer.cpu[column, :num_reqs_padded]
-                real_step = num_scheduled_tokens is not None
-                if not real_step or for_cudagraph_capture:
+                if ngc_length_views is not None:
+                    retained_gpu, retained, cm.max_seq_len = ngc_length_views[column]
+                else:
+                    # Capture independent addresses: later evictions may diverge.
+                    retained_gpu = retained_buffer.gpu[column, :num_reqs_padded]
+                    retained = retained_buffer.cpu[column, :num_reqs_padded]
                     retained_gpu.copy_(cm.seq_lens)
                     retained.copy_(self.optimistic_seq_lens_cpu[:num_reqs_padded])
                 cm.seq_lens = retained_gpu
@@ -2739,9 +2749,6 @@ class GPUModelRunner(
                 cm.seq_lens_cpu_upper_bound = retained
                 cm._num_computed_tokens_cpu = None
                 cm._num_computed_tokens_cache = None
-                if real_step and not for_cudagraph_capture:
-                    assert ngc_max_seq_lens is not None
-                    cm.max_seq_len = int(ngc_max_seq_lens[column])
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
@@ -4464,6 +4471,9 @@ class GPUModelRunner(
             logits_indices, spec_decode_metadata, max_num_sampled_tokens = (
                 self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
             )
+            ngc_fused_boundary = self._prepare_ngc_fused_decode(
+                num_reqs, max_num_scheduled_tokens
+            )
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4488,6 +4498,8 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                # Ordinary decode graphs contain no scoring operations.
+                force_eager=ngc_fused_boundary,
                 allow_microbatching=self._allow_microbatching(
                     num_reqs, num_scheduled_tokens_np
                 ),
@@ -4656,13 +4668,26 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
+            forward_kwargs = dict(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if ngc_fused_boundary and self._can_graph_ngc_boundary(attn_metadata):
+                # Keep ordinary graph keys separate from boundary execution.
+                model_output = self._ngc_boundary_graph.run(
+                    functools.partial(self._model_forward, **forward_kwargs),
+                    lambda: self._ngc_graph_dependencies(
+                        attn_metadata, slot_mappings, forward_kwargs
+                    ),
+                    capture_ready=self.ngc_scoring_buffers.fused_graph_ready,
+                )
+                if self._ngc_boundary_graph.graph is not None:
+                    self.ngc_scoring_buffers.publish_fused_graph_scores()
+            else:
+                model_output = self._model_forward(**forward_kwargs)
             self._score_ngc_pages(num_reqs)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
@@ -7687,6 +7712,118 @@ class GPUModelRunner(
             slot_mapping=self.routed_experts_slot_mapping_device[:num_tokens].clone(),
         )
 
+    def _can_graph_ngc_boundary(self, attn_metadata) -> bool:
+        offload = self.vllm_config.offload_config
+        return (
+            self.device.type == "cuda"
+            and not self.model_config.enforce_eager
+            and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and self.parallel_config.tensor_parallel_size == 1
+            and self.parallel_config.data_parallel_size == 1
+            and not self.model_config.is_moe
+            and self.lora_config is None
+            and not offload.uva.cpu_offload_gb
+            and not offload.prefetch.offload_group_size
+            and not has_kv_transfer_group()
+            and not self.use_aux_hidden_state_outputs
+            and isinstance(attn_metadata, dict)
+            and set(attn_metadata)
+            == set(self.ngc_scoring_buffers.fused_graph_inputs()["layers"])
+        )
+
+    def _ngc_graph_dependencies(self, attn_metadata, slot_mappings, model_inputs):
+        # Every attention layer is fused here; its loop bound comes from device
+        # descriptors, not TritonAttentionMetadata.max_seq_len.
+        metadata = {
+            name: {
+                key: value
+                for key, value in vars(layer_metadata).items()
+                if key != "max_seq_len"
+            }
+            for name, layer_metadata in attn_metadata.items()
+        }
+        return (
+            model_inputs,
+            metadata,
+            slot_mappings,
+            self.ngc_scoring_buffers.fused_graph_inputs(),
+            [layer.kv_cache for _, layer in self._ngc_scoring_layers],
+        )
+
+    def _prepare_ngc_fused_decode(self, num_reqs: int, max_query_len: int) -> bool:
+        buffers = self.ngc_scoring_buffers
+        buffers.reset_fused_decode()
+        if max_query_len != 1 or not self._ngc_scoring_layers:
+            return False
+        cadences = {
+            policy.cadence
+            for _, layer in self._ngc_scoring_layers
+            if (policy := layer.ngc_eviction_config) is not None
+        }
+        request_info = []
+        pending_cadences: set[int] = set()
+        for index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            seq_len = int(self.optimistic_seq_lens_cpu[index])
+            pending_cadences.update(
+                cadence
+                for cadence in cadences
+                if buffers.any_due(req_id, seq_len, cadence, mark_checked=False)
+            )
+            request_info.append((index, req_id, seq_len))
+        if not pending_cadences:
+            return False
+        inputs = []
+        due = {}
+        for group_id, layer in self._ngc_scoring_layers:
+            policy = layer.ngc_eviction_config
+            assert policy is not None
+            if policy.cadence not in pending_cadences:
+                continue
+            impl = cast("TritonAttentionImpl", layer.impl)
+            if (
+                impl.alibi_slopes is not None
+                or impl.sinks is not None
+                or impl.logits_soft_cap != 0
+                or impl.sliding_window != (-1, -1)
+            ):
+                continue
+            requests = []
+            for index, req_id, seq_len in request_info:
+                is_due = (
+                    buffers.due_boundary(
+                        req_id, layer.layer_name, seq_len, policy.cadence
+                    )
+                    is not None
+                )
+                due[req_id, layer.layer_name] = is_due
+                requests.append((index, req_id, seq_len, is_due))
+            if not any(item[3] for item in requests):
+                continue
+            table = self.input_batch.block_table[group_id]
+            block_table = table.get_device_tensor(num_reqs)
+            block_size = self.kv_cache_config.kv_cache_groups[
+                group_id
+            ].kv_cache_spec.block_size
+            for index, req_id, seq_len, _ in requests:
+                update = self._ngc_layouts.get(req_id, {}).get(group_id)
+                evicted = update.evicted_tokens if update else 0
+                inputs.append(
+                    NGCScoreInput(
+                        req_id,
+                        layer.layer_name,
+                        index,
+                        seq_len - evicted,
+                        evicted,
+                        block_size,
+                        table.block_size,
+                        update.page_positions if update else (),
+                        block_table,
+                    )
+                )
+        if inputs:
+            buffers.prepare_fused_decode(inputs, due)
+        return bool(inputs)
+
     def _score_ngc_pages(self, num_reqs: int) -> None:
         """Score retained keys using their original positions after KV writes."""
         buffers = self.ngc_scoring_buffers
@@ -7697,11 +7834,10 @@ class GPUModelRunner(
         score_tables = {}
         for req_index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
             seq_len = int(self.optimistic_seq_lens_cpu[req_index])
-            generated = max(seq_len - self.requests[req_id].num_prompt_tokens, 0)
             due = {
                 cadence
                 for cadence in cadences
-                if buffers.any_due(req_id, generated, cadence)
+                if buffers.any_due(req_id, seq_len, cadence)
             }
             if not due:
                 continue
@@ -7713,7 +7849,7 @@ class GPUModelRunner(
                     continue
                 if (
                     buffers.due_boundary(
-                        req_id, layer.layer_name, generated, policy.cadence
+                        req_id, layer.layer_name, seq_len, policy.cadence
                     )
                     is None
                 ):
@@ -7740,16 +7876,25 @@ class GPUModelRunner(
                     )
                 )
                 pending.append(
-                    (req_index, req_id, group_id, layer, generated, block_size)
+                    (req_index, req_id, group_id, layer, seq_len, block_size)
                 )
-        prepared = buffers.prepare_score_inputs(score_inputs)
-        for req_index, req_id, group_id, layer, generated, block_size in pending:
+        prepared = dict(buffers.fused_inputs)
+        prepared.update(
+            buffers.prepare_score_inputs(
+                [
+                    item
+                    for item in score_inputs
+                    if (item.req_id, item.layer_name) not in prepared
+                ]
+            )
+        )
+        for req_index, req_id, group_id, layer, seq_len, block_size in pending:
             self._score_ngc_layer(
                 req_index,
                 req_id,
                 group_id,
                 layer,
-                generated,
+                seq_len,
                 block_size,
                 prepared[req_id, layer.layer_name],
             )
@@ -7760,7 +7905,7 @@ class GPUModelRunner(
         req_id: str,
         group_id: int,
         layer: Attention,
-        generated: int,
+        seq_len: int,
         block_size: int,
         prepared: NGCPreparedScoreInput,
     ) -> None:
@@ -7780,7 +7925,7 @@ class GPUModelRunner(
             req_id,
             layer.layer_name,
             group_id=group_id,
-            computed_generated_tokens=generated,
+            computed_tokens=seq_len,
             cadence=policy.cadence,
             eviction_rate=policy.eviction_rate,
             min_retained_tokens=policy.min_retained_tokens,
@@ -7791,7 +7936,14 @@ class GPUModelRunner(
             page_size=block_size,
             softmax_scale=layer.ngc_softmax_scale,
             reduce_scores=get_tp_group().all_reduce,
-            prepared=prepared,
+            prepared=(
+                None
+                if (req_id, layer.layer_name) in self.ngc_scoring_buffers.fused_inputs
+                else prepared
+            ),
+            precomputed_scores=self.ngc_scoring_buffers.get_fused_scores(
+                req_id, layer.layer_name
+            ),
         )
 
     def _prepare_ngc_evicted(self, num_reqs: int) -> None:
@@ -7831,9 +7983,11 @@ class GPUModelRunner(
 
         for _, layer in self._ngc_scoring_layers:
             layer.ngc_query_capture = None
+            layer.ngc_fused_decode = None
         self._ngc_scoring_layers = []
         self._ngc_columns_checked = False
         self.ngc_scoring_buffers = NGCScoringBuffers()
+        self._ngc_boundary_graph = NGCBoundaryGraph()
         self._ngc_layouts = {}
         self._ngc_request_offsets = {}
         self._ngc_columns = {}
@@ -7927,6 +8081,9 @@ class GPUModelRunner(
             for _, layer in self._ngc_scoring_layers:
                 layer.ngc_query_capture = functools.partial(
                     self.ngc_scoring_buffers.capture, layer.layer_name
+                )
+                layer.ngc_fused_decode = functools.partial(
+                    self.ngc_scoring_buffers.fused_decode, layer.layer_name
                 )
 
     def init_routed_experts_capturer(self):

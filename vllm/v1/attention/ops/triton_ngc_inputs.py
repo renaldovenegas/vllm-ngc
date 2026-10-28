@@ -43,6 +43,7 @@ def prepare_ngc_score_inputs(
     PAGE_SIZE: tl.constexpr,
     KERNEL_PAGE_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
+    GATHER_QUERIES: tl.constexpr = True,
 ):
     program = tl.program_id(0).to(tl.int64)
     batch = program // tiles_per_request
@@ -57,24 +58,25 @@ def prepare_ngc_score_inputs(
     page_offset = tl.load(descriptor + 6)
     req_index = tl.load(descriptor + 7)
 
-    query_index = offsets // WIDTH
-    positions = seq_len - count + query_index
-    source_rows = slot * RING_WINDOW + positions % RING_WINDOW
-    values = tl.load(
-        ring + source_rows * WIDTH + offsets % WIDTH,
-        query_index < count,
-        0,
-    )
-    tl.store(
-        queries + batch * WINDOW * WIDTH + offsets,
-        values,
-        offsets < WINDOW * WIDTH,
-    )
-    tl.store(
-        query_positions + batch * WINDOW + offsets,
-        seq_len - count + offsets,
-        offsets < count,
-    )
+    if GATHER_QUERIES:
+        query_index = offsets // WIDTH
+        positions = seq_len - count + query_index
+        source_rows = slot * RING_WINDOW + positions % RING_WINDOW
+        values = tl.load(
+            ring + source_rows * WIDTH + offsets % WIDTH,
+            query_index < count,
+            0,
+        )
+        tl.store(
+            queries + batch * WINDOW * WIDTH + offsets,
+            values,
+            offsets < WINDOW * WIDTH,
+        )
+        tl.store(
+            query_positions + batch * WINDOW + offsets,
+            seq_len - count + offsets,
+            offsets < count,
+        )
 
     page = offsets // PAGE_SIZE
     known_position = tl.load(

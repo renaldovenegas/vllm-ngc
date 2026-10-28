@@ -78,7 +78,7 @@ class NGCEvictionConfig:
     """Per-layer NGC eviction policy; passing it to Attention opts the layer in."""
 
     cadence: int = Field(default=32, gt=0, strict=True)
-    """Committed generated tokens per request between eviction events."""
+    """Computed tokens per request between eviction events, including prompt tokens."""
     query_buffer_size: int = Field(default=5, gt=0, strict=True)
     """Number of recent query vectors retained per request and layer for scoring."""
     min_retained_tokens: int = Field(default=1, gt=0, strict=True)
