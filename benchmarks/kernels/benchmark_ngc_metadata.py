@@ -24,7 +24,6 @@ def main():
                 pin_memory=True,
                 device=torch.device("cuda"),
                 block_sizes=[16] * groups,
-                kernel_block_sizes=[16] * groups,
                 max_num_blocks=[160] * groups,
                 batched_group_ids=tuple(range(groups)),
             )

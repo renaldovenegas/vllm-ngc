@@ -139,6 +139,7 @@ def run_case(
     cadence: int = 128,
     query_window: int = 5,
     repeats: int = 3,
+    temperature: float = 0.6,
 ) -> None:
     import torch
 
@@ -232,7 +233,7 @@ def run_case(
         assert len(token_ids) == prompt_tokens
     assert token_ids and all(isinstance(token, int) for token in token_ids)
     sampling = dict(
-        temperature=0.6,
+        temperature=temperature,
         top_p=1.0,
         top_k=-1,
         min_p=0.0,
@@ -1157,6 +1158,7 @@ def sweep(
     cadence: int = 128,
     query_window: int = 5,
     repeats: int = 3,
+    temperature: float = 0.6,
     step_trace: bool = False,
     num_seqs: int = 1,
 ) -> None:
@@ -1227,6 +1229,8 @@ def sweep(
                 str(query_window),
                 "--repeats",
                 str(repeats),
+                "--temperature",
+                str(temperature),
             ]
             + (["--profile"] if profiling else [])
             + (["--profile-only"] if profile_only else [])
@@ -1292,6 +1296,13 @@ def sweep(
             )
             summary[f"before_after_{rate}_hashes_match"] = match
             assert match, f"Output hashes differ for {rate}"
+    if "upstream-graph" in reports and "0-graph" in reports:
+        match = (
+            reports["upstream-graph"]["output_token_hashes"]
+            == reports["0-graph"]["output_token_hashes"]
+        )
+        summary["upstream_zero_output_hashes_match"] = match
+        assert match, "Pristine upstream and zero-eviction output hashes differ"
     if step_trace:
         summary["step_trace"] = compare_steps(reports, cases, result_dir)
         print(json.dumps(summary["step_trace"], indent=2), flush=True)
@@ -1320,6 +1331,7 @@ if __name__ == "__main__":
     parser.add_argument("--cadence", type=int, default=128)
     parser.add_argument("--query-window", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--temperature", type=float, default=0.6)
     args = parser.parse_args()
     if (
         args.prompt_tokens < 0
@@ -1350,6 +1362,7 @@ if __name__ == "__main__":
             cadence=args.cadence,
             query_window=args.query_window,
             repeats=args.repeats,
+            temperature=args.temperature,
             step_trace=args.step_trace,
             num_seqs=args.num_seqs,
         )
@@ -1367,6 +1380,7 @@ if __name__ == "__main__":
             cadence=args.cadence,
             query_window=args.query_window,
             repeats=args.repeats,
+            temperature=args.temperature,
             step_trace=args.step_trace,
             num_seqs=args.num_seqs,
         )

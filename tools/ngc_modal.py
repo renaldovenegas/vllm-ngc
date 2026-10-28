@@ -13,7 +13,7 @@ from uuid import uuid4
 import modal
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE_COMMIT = "1f76efaa2195485b92cb04215aba6fb8f5fe523d"
+BASE_COMMIT = "5df63a7203cdb9328d824a27b682e77c7b9928be"
 GPU = os.environ.get("NGC_MODAL_GPU", "L4")
 REMOTE_ROOT = Path("/opt/vllm")
 UPSTREAM_ROOT = Path("/opt/upstream")
@@ -98,6 +98,7 @@ image = (
             "VLLM_USE_V2_MODEL_RUNNER": "0",
             "VLLM_USE_FLASHINFER_SAMPLER": "0",
             "NGC_MODAL_GPU": GPU,
+            "NGC_MODAL_DISABLE_FUSION": os.environ.get("NGC_MODAL_DISABLE_FUSION", "0"),
             "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
             "PYTHONUNBUFFERED": "1",
         }
@@ -164,6 +165,7 @@ def run_tests(
             source_hash.update(path.read_bytes())
     if job in {
         "speed-upstream",
+        "upstream-check",
         "speed-batch",
         "speed-batch-graph",
         "profile-batch-graph",
@@ -337,6 +339,7 @@ def main(
         "profile",
         "speed-long",
         "speed-upstream",
+        "upstream-check",
         "step-trace",
         "speed-batch",
         "graph-baseline",

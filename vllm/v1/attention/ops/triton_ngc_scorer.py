@@ -222,6 +222,7 @@ def ngc_page_scores(
     Raises:
         ValueError: Shapes, layout, or sizes violate the input contract.
         TypeError: Query, cache, or block-table dtypes are unsupported.
+
     """
     if query.ndim != 3 or key_cache.ndim != 4 or block_table.ndim != 1:
         raise ValueError("Expected 3D queries, a 4D key cache, and a 1D block table")

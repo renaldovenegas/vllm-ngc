@@ -6,6 +6,7 @@ import argparse
 import functools
 import inspect
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -59,6 +60,19 @@ def smoke(
     from vllm.v1.core.single_type_kv_cache_manager import NGCEvictionManager
     from vllm.v1.worker.ngc_scoring import NGCScoringBuffers
 
+    disable_fusion = os.environ.get("NGC_MODAL_DISABLE_FUSION") == "1"
+    original_prepare_fused = None
+    if disable_fusion:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+        original_prepare_fused = GPUModelRunner._prepare_ngc_fused_decode
+
+        def prepare_without_fusion(self, *args, **kwargs):
+            self.ngc_scoring_buffers.reset_fused_decode()
+            return False
+
+        GPUModelRunner._prepare_ngc_fused_decode = prepare_without_fusion
+
     original_init = Attention.__init__
     signature = inspect.signature(original_init)
     batched = hasattr(NGCEvictionManager, "detach_eviction_blocks")
@@ -77,6 +91,7 @@ def smoke(
     original_graph_run = NGCBoundaryGraph.run if NGCBoundaryGraph is not None else None
     fused_counts = {
         "supported": original_fused is not None,
+        "disabled_by_harness": disable_fusion,
         "successful_calls": 0,
         "precomputed_score_decisions": 0,
         "boundary_graph_captures": 0,
@@ -317,6 +332,8 @@ def smoke(
             json.dumps(fused_counts, indent=2)
         )
         Attention.__init__ = original_init
+        if original_prepare_fused is not None:
+            GPUModelRunner._prepare_ngc_fused_decode = original_prepare_fused
         setattr(NGCEvictionManager, eviction_method, original_evict)
         if batched:
             KVCacheManager.apply_ngc_evictions = original_batch
@@ -439,6 +456,7 @@ def main() -> None:
             "profile",
             "speed-long",
             "speed-upstream",
+            "upstream-check",
             "scheduler-ab",
             "metadata-ab",
             "speed-eviction",
@@ -495,6 +513,32 @@ def main() -> None:
                 ],
                 check=True,
             )
+        return
+    if args.job == "upstream-check":
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("ngc_modal_benchmark.py")),
+                "--model",
+                args.model,
+                "--result-dir",
+                str(args.result_dir),
+                "--cases",
+                "upstream-graph",
+                "0-graph",
+                "--num-seqs",
+                "2",
+                "--output-tokens",
+                "512",
+                "--warmup-tokens",
+                "256",
+                "--repeats",
+                "1",
+                "--temperature",
+                "0",
+            ],
+            check=True,
+        )
         return
     if args.job == "graph-baseline":
         # Upstream eager vs CUDA graphs at batch 1 and 50 on one GPU.

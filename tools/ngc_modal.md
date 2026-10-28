@@ -307,7 +307,7 @@ exit and uses Modal storage. No serving endpoint is deployed.
 ## Dependency compatibility
 
 The environment installs the upstream source and CUDA 13.0 precompiled artifacts
-for commit `1f76efaa2195485b92cb04215aba6fb8f5fe523d`, then overlays this checkout's
+for stable v0.32.0 commit `5df63a7203cdb9328d824a27b682e77c7b9928be`, then overlays this checkout's
 `vllm/` source. Generated native libraries stay in the editable installation;
 local `.venv`, `.git`, credentials, and local compiled libraries are not uploaded.
 

@@ -473,7 +473,10 @@ def test_handoff_accepts_only_completed_current_cache_snapshots(
 
 
 @pytest.mark.parametrize("max_query_len", [1, 4])
-def test_ngc_shared_metadata_matches_build_with_independent_cache(max_query_len):
+@pytest.mark.parametrize("segments,max_seqs_64", [(16, 0), (64, 1), (64, 2)])
+def test_ngc_shared_metadata_matches_build_with_independent_cache(
+    max_query_len, segments, max_seqs_64
+):
     """Reusing batch fields preserves per-layer lengths, tables, and scratch."""
     from dataclasses import fields
 
@@ -483,10 +486,12 @@ def test_ngc_shared_metadata_matches_build_with_independent_cache(max_query_len)
     def make_builder():
         builder = object.__new__(TritonAttentionMetadataBuilder)
         builder.seq_threshold_3D = 8
-        builder.num_par_softmax_segments = 16
-        builder.softmax_segm_output = torch.empty(2)
-        builder.softmax_segm_max = torch.empty(2)
-        builder.softmax_segm_expsum = torch.empty(2)
+        builder.num_par_softmax_segments = segments
+        builder.num_heads_q = 2
+        builder.max_seqs_64_segments = max_seqs_64
+        builder.softmax_segm_output = torch.empty(2, 2, segments, 8)
+        builder.softmax_segm_max = torch.empty(2, 2, segments)
+        builder.softmax_segm_expsum = torch.empty(2, 2, segments)
         builder.rswa_window = None
         return builder
 
@@ -519,7 +524,8 @@ def test_ngc_shared_metadata_matches_build_with_independent_cache(max_query_len)
             getattr(expected, field.name),
         )
         if isinstance(expected_value, torch.Tensor):
-            assert actual_value is expected_value
+            assert actual_value.data_ptr() == expected_value.data_ptr()
+            assert actual_value.shape == expected_value.shape
         else:
             assert actual_value == expected_value
     assert template.seq_lens is common.seq_lens
@@ -951,6 +957,76 @@ def test_ngc_fused_decode_matches_attention_and_standalone_scores(
     torch.testing.assert_close(
         output[0].float(), reference, atol=tolerance, rtol=tolerance
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("num_segments", [16, 64])
+def test_ngc_fused_decode_unified_numerics(num_segments, record_property):
+    """Measure rounding against the standard decoder at Qwen's first boundary."""
+    from vllm.v1.attention.ops.triton_ngc_decode import ngc_decode_and_score
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+
+    torch.manual_seed(37)
+    device = "cuda"
+    query = torch.randn(2, 28, 128, device=device, dtype=torch.float16)
+    cache = torch.randn(16, 4, 16, 256, device=device, dtype=torch.float16)
+    table = torch.arange(16, device=device, dtype=torch.int32).reshape(2, 8)
+    lengths = torch.tensor([122, 128], device=device, dtype=torch.int32)
+    descriptors = torch.tensor(
+        [[122, 0, 1, 122, 0, 0, 0, 0], [128, 1, 1, 128, 0, 0, 0, 1]],
+        device=device,
+        dtype=torch.int64,
+    )
+    ring = torch.zeros(11, 28, 128, device=device, dtype=torch.float16)
+    ring[1], ring[7] = query[0], query[1]
+    positions = torch.arange(128, device=device).expand(2, -1).contiguous()
+    due = torch.tensor([False, True], device=device)
+    fused, standard = torch.empty_like(query), torch.empty_like(query)
+    ngc_decode_and_score(
+        query,
+        cache,
+        ring,
+        descriptors,
+        positions,
+        table,
+        due,
+        fused,
+        window=5,
+        ring_window=5,
+        page_size=16,
+        max_kept=128,
+        softmax_scale=128**-0.5,
+        num_segments=num_segments,
+    )
+    unified_attention(
+        q=query,
+        k=cache[..., :128].transpose(1, 2),
+        v=cache[..., 128:].transpose(1, 2),
+        out=standard,
+        cu_seqlens_q=torch.arange(3, device=device, dtype=torch.int32),
+        max_seqlen_q=1,
+        seqused_k=lengths,
+        max_seqlen_k=128,
+        softmax_scale=128**-0.5,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=table,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=8,
+        num_par_softmax_segments=num_segments,
+        softmax_segm_output=torch.empty(2, 28, num_segments, 128, device=device),
+        softmax_segm_max=torch.empty(2, 28, num_segments, device=device),
+        softmax_segm_expsum=torch.empty(2, 28, num_segments, device=device),
+    )
+    error = (fused.float() - standard.float()).abs()
+    record_property("fused_unified_max_abs", error.max().item())
+    record_property(
+        "fused_unified_equal_fraction", (fused == standard).float().mean().item()
+    )
+    torch.testing.assert_close(fused, standard, atol=0.003, rtol=0.003)
 
 
 def test_ngc_precomputed_scores_skip_standalone_scorer():
