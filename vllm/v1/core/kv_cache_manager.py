@@ -212,6 +212,11 @@ class KVCacheManager:
             for manager in self.coordinator.single_type_managers
             if manager.retains_longer_hit
         )
+        self.ngc_managers = tuple(
+            (group_id, manager)
+            for group_id, manager in enumerate(self.coordinator.single_type_managers)
+            if isinstance(manager, NGCEvictionManager)
+        )
         self.kv_cache_config = kv_cache_config
 
         # Watermark: minimum number of KV cache blocks to keep free when
@@ -386,12 +391,9 @@ class KVCacheManager:
         Workers extend untouched layouts from ordinary block appends.
         """
         updates = {}
-        for group_id, manager in enumerate(self.coordinator.single_type_managers):
-            if (
-                isinstance(manager, NGCEvictionManager)
-                and request_id in manager.changed_requests
-            ):
-                manager.changed_requests.discard(request_id)
+        for group_id, manager in self.ngc_managers:
+            if request_id in manager.changed_requests:
+                manager.changed_requests.remove(request_id)
                 updates[group_id] = manager.get_cache_update(request_id)
         return updates
 

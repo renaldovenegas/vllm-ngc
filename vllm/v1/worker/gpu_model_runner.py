@@ -496,6 +496,8 @@ class GPUModelRunner(
         self._ngc_evicted: CpuGpuBuffer | None = None
         self._ngc_evicted_rows = 0
         self._ngc_evicted_any: np.ndarray | None = None
+        self._ngc_evicted_request_ids: tuple[str, ...] = ()
+        self._ngc_offsets_dirty = True
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
@@ -1206,6 +1208,7 @@ class GPUModelRunner(
             self.ngc_scoring_buffers.discard_request(req_id)
             self._ngc_layouts.pop(req_id, None)
             self._ngc_request_offsets.pop(req_id, None)
+            self._ngc_offsets_dirty = True
             req_state = self.requests.pop(req_id, None)
             self._on_request_state_removed(req_id, req_state)
             self.num_prompt_logprobs.pop(req_id, None)
@@ -1247,6 +1250,7 @@ class GPUModelRunner(
             self.ngc_scoring_buffers.discard_request(req_id, keep_cadence=True)
             self._ngc_layouts.pop(req_id, None)
             self._ngc_request_offsets.pop(req_id, None)
+            self._ngc_offsets_dirty = True
         # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
         # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
         # apart from the forced-preemption case in reset_prefix_cache. And in
@@ -1525,6 +1529,7 @@ class GPUModelRunner(
         self.input_batch.refresh_metadata()
 
         for req_id, updates in scheduler_output.ngc_cache_updates.items():
+            self._ngc_offsets_dirty = True
             req_index = self.input_batch.req_id_to_index[req_id]
             self._ngc_layouts.setdefault(req_id, {}).update(updates)
             offsets = self._ngc_request_offsets.get(req_id)
@@ -7517,6 +7522,7 @@ class GPUModelRunner(
             precomputed_scores=self.ngc_scoring_buffers.get_fused_scores(
                 req_id, layer.layer_name
             ),
+            defer_selection=True,
         )
 
     def _prepare_ngc_evicted(self, num_reqs: int) -> None:
@@ -7530,18 +7536,22 @@ class GPUModelRunner(
             ), "NGC columns must follow the packed block-table order"
             self._ngc_columns_checked = True
         values = self._ngc_evicted.np
-        values[:num_reqs] = 0
-        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            offsets = self._ngc_request_offsets.get(req_id)
-            if offsets is not None:
-                values[i] = offsets
-        # Rows past the batch stay zero so padded requests keep their lengths.
-        rows = max(num_reqs, self._ngc_evicted_rows)
-        values[num_reqs:rows] = 0
-        self._ngc_evicted_any = values[:num_reqs].any(axis=0)
-        if self._ngc_evicted_any.any() or self._ngc_evicted_rows:
-            self._ngc_evicted.copy_to_gpu(rows)
-        self._ngc_evicted_rows = num_reqs if self._ngc_evicted_any.any() else 0
+        req_ids = tuple(self.input_batch.req_ids[:num_reqs])
+        if self._ngc_offsets_dirty or req_ids != self._ngc_evicted_request_ids:
+            values[:num_reqs] = 0
+            for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                offsets = self._ngc_request_offsets.get(req_id)
+                if offsets is not None:
+                    values[i] = offsets
+            # Rows past the batch stay zero so padded requests keep their lengths.
+            rows = max(num_reqs, self._ngc_evicted_rows)
+            values[num_reqs:rows] = 0
+            self._ngc_evicted_any = values[:num_reqs].any(axis=0)
+            if self._ngc_evicted_any.any() or self._ngc_evicted_rows:
+                self._ngc_evicted.copy_to_gpu(rows)
+            self._ngc_evicted_rows = num_reqs if self._ngc_evicted_any.any() else 0
+            self._ngc_evicted_request_ids = req_ids
+            self._ngc_offsets_dirty = False
         retained = self.input_batch.block_table.ngc_retained
         assert retained is not None
         np.subtract(
@@ -7567,6 +7577,8 @@ class GPUModelRunner(
         self._ngc_evicted = None
         self._ngc_evicted_rows = 0
         self._ngc_evicted_any = None
+        self._ngc_evicted_request_ids = ()
+        self._ngc_offsets_dirty = True
         layers = self.compilation_config.static_forward_context
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
             if not isinstance(group.kv_cache_spec, NGCEvictionSpec):

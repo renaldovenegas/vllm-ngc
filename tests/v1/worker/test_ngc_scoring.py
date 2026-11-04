@@ -691,6 +691,61 @@ def test_ngc_full_graph_capture_switches_inactive_active_inactive(monkeypatch):
     torch.testing.assert_close(buffers._rings["layer"], previous)
 
 
+def test_ngc_packed_metadata_reuses_positions_and_one_due_upload(monkeypatch):
+    """Unchanged layouts upload descriptors only; due masks share one transfer."""
+    import sys
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.ngc_scoring import NGCScoreInput
+
+    class NoOpGather:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.attention.ops.triton_ngc_inputs",
+        SimpleNamespace(prepare_ngc_score_inputs=NoOpGather()),
+    )
+    buffers = _ring_buffers(2, layers=("layer.0", "layer.1"))
+    _step(buffers, [("a", 0, 64), ("b", 0, 64)])
+    table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    inputs = [
+        NGCScoreInput(req, layer, row, 32, 32, 16, 16, (0, 48), table)
+        for layer in ("layer.0", "layer.1")
+        for row, req in enumerate(("a", "b"))
+    ]
+    calls = []
+    original = CpuGpuBuffer.copy_to_gpu
+
+    def copy(buffer, n=None):
+        calls.append((buffer, n))
+        return original(buffer, n)
+
+    monkeypatch.setattr(CpuGpuBuffer, "copy_to_gpu", copy)
+    due = {(i.req_id, i.layer_name): i.req_id == "a" for i in inputs}
+    buffers.prepare_fused_decode(inputs, due)
+    packed, masks = buffers._score_inputs, buffers._fused_due_batch
+    assert [(n) for buffer, n in calls if buffer is packed] == [40]
+    assert sum(buffer is masks for buffer, _ in calls) == 1
+    pointer = masks.gpu.data_ptr()
+    calls.clear()
+    due = {key: not value for key, value in due.items()}
+    buffers.prepare_fused_decode(inputs, due)
+    assert [n for buffer, n in calls if buffer is packed] == [32]
+    assert sum(buffer is masks for buffer, _ in calls) == 1
+    assert masks.gpu.data_ptr() == pointer
+    assert all(
+        state.due.tolist() == [False, True] for state in buffers._fused_decode.values()
+    )
+    calls.clear()
+    inputs[0] = replace(inputs[0], page_positions=(16, 48))
+    buffers.prepare_fused_decode(inputs, due)
+    assert [n for buffer, n in calls if buffer is packed] == [40]
+    buffers.prepare_fused_decode([], {})
+    assert not buffers._fused_decode and not buffers.fused_inputs
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 @pytest.mark.parametrize("kernel_page_size", [8, 16])
 def test_ngc_packed_score_inputs_match_individual_gathers(kernel_page_size):
@@ -1082,6 +1137,92 @@ def test_ngc_fused_decode_unified_numerics(num_segments, record_property):
         "fused_unified_equal_fraction", (fused == standard).float().mean().item()
     )
     torch.testing.assert_close(fused, standard, atol=0.003, rtol=0.003)
+
+
+def _defer_test_scores(buffers, req_id, layer, scores, rate=0.5, **overrides):
+    kwargs = dict(
+        group_id=int(layer[-1]),
+        computed_tokens=64,
+        cadence=64,
+        eviction_rate=rate,
+        min_retained_tokens=16,
+        key_cache=torch.empty(0),
+        kernel_block_table=torch.arange(len(scores), device=scores.device),
+        block_ids=torch.arange(len(scores), device=scores.device) + 100,
+        key_positions=torch.arange(len(scores) * 16, device=scores.device),
+        page_size=16,
+        softmax_scale=1.0,
+        precomputed_scores=scores,
+        defer_selection=True,
+    )
+    kwargs.update(overrides)
+    return buffers.score_if_due(req_id, layer, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+)
+@pytest.mark.parametrize("debug", [False, True])
+def test_deferred_selection_matches_scalar_ties_rates_and_variable_lengths(
+    debug, device, monkeypatch
+):
+    """One handoff preserves scalar ranking and request/layer proposal order."""
+    layers = ("layer.0", "layer.1")
+    scalar, batched = (_ring_buffers(2, layers=layers) for _ in range(2))
+    for buffers in (scalar, batched):
+        buffers.include_debug_scores = debug
+        _step(buffers, [("a", 0, 64), ("b", 0, 64)])
+    inputs = [
+        ("a", "layer.0", [1.0, 1.0, 0.0, 0.0], 0.5),
+        ("a", "layer.1", [2.0, 2.0, 2.0, 0.0], 0.75),
+        ("b", "layer.0", [2.0, 1.0, 0.0], 0.75),
+        ("b", "layer.1", [1.0, 1.0, 0.0], 0.0),
+    ]
+    for req, layer, values, rate in inputs:
+        scores = torch.tensor(values, device=device)
+        _defer_test_scores(scalar, req, layer, scores, rate, defer_selection=False)
+        assert _defer_test_scores(batched, req, layer, scores, rate) is None
+    copies = []
+    original = batched._copy_handoff
+
+    def handoff(tensors):
+        copies.append(len(tensors))
+        return original(tensors)
+
+    monkeypatch.setattr(batched, "_copy_handoff", handoff)
+    versions = {"a": 11, "b": 22}
+    expected = scalar.take_proposals(versions, list(layers))
+    if not debug:
+        expected = [p for p in expected if p.victim_indices]
+    assert batched.take_proposals(versions, list(layers)) == expected
+    assert len(copies) == 1
+    assert not batched.take_proposals(versions, list(layers))
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf")])
+def test_deferred_zero_rate_still_validates_finite_scores(invalid):
+    buffers = _ring_buffers(2)
+    _step(buffers, [("a", 0, 64)])
+    scores = torch.tensor([invalid, 1.0, 2.0, 0.0])
+    _defer_test_scores(buffers, "a", "layer.0", scores, rate=0)
+    with pytest.raises(ValueError, match="finite"):
+        buffers.take_proposals({"a": 1}, ["layer.0"])
+    scores[0] = 0
+    assert not buffers.take_proposals({"a": 1}, ["layer.0"])
+
+
+@pytest.mark.parametrize("invalidate", ["capture", "discard"])
+def test_deferred_borrowed_scores_do_not_survive_request_invalidation(invalidate):
+    buffers = _ring_buffers(2)
+    _step(buffers, [("a", 0, 64)])
+    scores = torch.tensor([1.0, 2.0, 3.0, 0.0])
+    _defer_test_scores(buffers, "a", "layer.0", scores)
+    scores.fill_(float("nan"))
+    if invalidate == "capture":
+        _step(buffers, [("a", 64, 1)])
+    else:
+        buffers.discard_request("a")
+    assert not buffers.take_proposals({"a": 1}, ["layer.0"])
 
 
 def test_ngc_precomputed_scores_skip_standalone_scorer():

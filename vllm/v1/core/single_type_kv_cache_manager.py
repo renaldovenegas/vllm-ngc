@@ -849,10 +849,15 @@ class NGCEvictionManager(SingleTypeKVCacheManager):
             return None
         if not victims:
             return []
-        self.req_to_blocks[request_id] = [
-            block for i, block in enumerate(blocks) if i not in victims
-        ]
-        layout.evict(proposal.victim_indices, self.block_size)
+        kept_blocks = []
+        kept_positions = []
+        for i, block in enumerate(blocks):
+            if i not in victims:
+                kept_blocks.append(block)
+                kept_positions.append(layout.page_positions[i])
+        self.req_to_blocks[request_id] = kept_blocks
+        layout.page_positions = kept_positions
+        layout.evicted_tokens += len(victims) * self.block_size
         self.changed_requests.add(request_id)
         return removed
 

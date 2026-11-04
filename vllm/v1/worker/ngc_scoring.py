@@ -50,6 +50,22 @@ class NGCCadenceCheck:
 
 
 @dataclass
+class NGCPendingScore:
+    """Borrowed score storage, consumed before the next model forward."""
+
+    request_id: str
+    layer_name: str
+    group_id: int
+    cadence_boundary: int
+    computed_tokens: int
+    retained_tokens: int
+    page_size: int
+    num_victims: int
+    scores: torch.Tensor
+    block_ids: torch.Tensor
+
+
+@dataclass
 class NGCPageScores:
     scores: torch.Tensor
     block_ids: torch.Tensor
@@ -211,6 +227,8 @@ class NGCScoringBuffers:
         self._scored_boundaries: dict[tuple[str, str], int] = {}
         self._checked_boundaries: dict[tuple[str, int], int] = {}
         self._handoff: CpuGpuBuffer | None = None
+        self._pending_scores: dict[tuple[str, str], NGCPendingScore] = {}
+        self._score_input_layout: tuple | None = None
         self._rings: dict[str, torch.Tensor] = {}
         self._windows: dict[str, int] = {}
         self._window = 0
@@ -230,7 +248,8 @@ class NGCScoringBuffers:
         self._fused_decode: dict[str, NGCFusedDecodeState] = {}
         self._fused_scratch = NGCScratchBuffers()
         self._fused_scores = NGCScratchBuffers()
-        self._fused_due: dict[str, CpuGpuBuffer] = {}
+        self._fused_due: dict[str, torch.Tensor] = {}
+        self._fused_due_batch: CpuGpuBuffer | None = None
 
     def allocate(
         self,
@@ -284,6 +303,9 @@ class NGCScoringBuffers:
         self._slots = {}
         self._seq_lens = {}
         self._score_inputs = None
+        self._score_input_layout = None
+        self._pending_scores.clear()
+        self._fused_due_batch = None
         self._score_workspaces = {}
         self._prepared_groups.clear()
         self.reset_fused_decode()
@@ -356,6 +378,8 @@ class NGCScoringBuffers:
             self._seq_lens[req_id] = int(seq_len)
         for key in [key for key in self.histories if key[0] in scheduled]:
             del self.histories[key]
+        for key in [key for key in self._pending_scores if key[0] in scheduled]:
+            del self._pending_scores[key]
 
     def reset_capture(self) -> None:
         """Send every row to scratch, for dummy runs and graph capture."""
@@ -434,6 +458,12 @@ class NGCScoringBuffers:
                 device=device,
                 pin_memory=device.type == "cuda",
             )
+            self._score_input_layout = None
+        layout = tuple(
+            (item.req_id, item.layer_name, item.req_index, item.page_positions)
+            for item in ordered
+        )
+        positions_changed = layout != self._score_input_layout
         packed = self._score_inputs.np
         descriptors = packed[:descriptor_size].reshape(-1, 8)
         offset = descriptor_size
@@ -451,9 +481,11 @@ class NGCScoringBuffers:
                 offset,
                 item.req_index,
             )
-            packed[offset : offset + known] = item.page_positions
+            if positions_changed:
+                packed[offset : offset + known] = item.page_positions
             offset += known
-        self._score_inputs.copy_to_gpu(size)
+        self._score_inputs.copy_to_gpu(size if positions_changed else descriptor_size)
+        self._score_input_layout = layout
 
         prepared = {}
         start = 0
@@ -557,20 +589,29 @@ class NGCScoringBuffers:
         grouped: dict[str, list[NGCScoreInput]] = {}
         for item in inputs:
             grouped.setdefault(item.layer_name, []).append(item)
-        for layer_name, items in grouped.items():
+        if not grouped:
+            return
+        max_batch = max(len(items) for items in grouped.values())
+        shape = (len(grouped), 1 << (max_batch - 1).bit_length())
+        device = self._rings[next(iter(grouped))].device
+        if self._fused_due_batch is None or self._fused_due_batch.gpu.shape != shape:
+            self._fused_due_batch = CpuGpuBuffer(
+                *shape,
+                dtype=torch.bool,
+                device=device,
+                pin_memory=device.type == "cuda",
+            )
+        due_batch = self._fused_due_batch
+        due_batch.np.fill(False)
+        for row, items in enumerate(grouped.values()):
+            due_batch.np[row, : len(items)] = [
+                due[item.req_id, item.layer_name] for item in items
+            ]
+        due_batch.copy_to_gpu()
+        for row, (layer_name, items) in enumerate(grouped.items()):
             descriptors, workspace = self._prepared_groups[layer_name]
             batch = len(items)
-            due_buffer = self._fused_due.get(layer_name)
-            if due_buffer is None or due_buffer.gpu.numel() < batch:
-                due_buffer = CpuGpuBuffer(
-                    1 << (batch - 1).bit_length(),
-                    dtype=torch.bool,
-                    device=descriptors.device,
-                    pin_memory=descriptors.device.type == "cuda",
-                )
-                self._fused_due[layer_name] = due_buffer
-            due_buffer.np[:batch] = [due[item.req_id, layer_name] for item in items]
-            due_buffer.copy_to_gpu(batch)
+            self._fused_due[layer_name] = due_batch.gpu[row, :batch]
             capacity = workspace.key_positions.shape[1]
             pages = (capacity + items[0].page_size - 1) // items[0].page_size
             scores = self._fused_scores.get(
@@ -580,7 +621,7 @@ class NGCScoringBuffers:
                 items,
                 descriptors,
                 workspace,
-                due_buffer.gpu[:batch],
+                self._fused_due[layer_name],
                 score_buffer=scores,
             )
 
@@ -697,9 +738,86 @@ class NGCScoringBuffers:
             torch.accelerator.synchronize(device.index)
         return views
 
+    def _take_batched_proposals(
+        self, table_versions: dict[str, int], layer_names: list[str]
+    ) -> list[NGCEvictionProposal]:
+        pending = [
+            self._pending_scores[req_id, name]
+            for req_id in table_versions
+            for name in layer_names
+            if (req_id, name) in self._pending_scores
+        ]
+        if not pending:
+            return []
+        groups: dict[tuple, list[tuple[int, NGCPendingScore]]] = {}
+        for index, item in enumerate(pending):
+            key = (
+                item.scores.device,
+                item.scores.dtype,
+                item.scores.numel(),
+                item.num_victims,
+            )
+            groups.setdefault(key, []).append((index, item))
+        tensors: list[torch.Tensor] = []
+        packets = []
+        for items in groups.values():
+            scores = torch.stack([item.scores for _, item in items])
+            count = items[0][1].num_victims
+            offset = len(tensors)
+            tensors.append(torch.isfinite(scores).all().reshape(1))
+            if count or self.include_debug_scores:
+                ids = torch.stack([item.block_ids for _, item in items])
+                indices = torch.argsort(scores[:, :-1], dim=1, stable=True)[:, :count]
+                tensors.extend((indices, ids.gather(1, indices)))
+                if self.include_debug_scores:
+                    tensors.extend((ids, scores))
+            packets.append((items, offset))
+        copied = self._copy_handoff(tensors)
+        result: list[NGCEvictionProposal | None] = [None] * len(pending)
+        for items, offset in packets:
+            if not bool(copied[offset].all()):
+                raise ValueError("NGC page scores must be finite")
+            if not items[0][1].num_victims and not self.include_debug_scores:
+                continue
+            shape = (len(items), items[0][1].num_victims)
+            indices = copied[offset + 1].view(shape).tolist()
+            ids = copied[offset + 2].view(shape).tolist()
+            page_shape = (len(items), items[0][1].scores.numel())
+            debug_ids = (
+                copied[offset + 3].view(page_shape).tolist()
+                if self.include_debug_scores
+                else None
+            )
+            debug_scores = (
+                copied[offset + 4].view(page_shape).tolist()
+                if self.include_debug_scores
+                else None
+            )
+            for row, (index, item) in enumerate(items):
+                result[index] = NGCEvictionProposal(
+                    request_id=item.request_id,
+                    layer_name=item.layer_name,
+                    group_id=item.group_id,
+                    table_version=table_versions[item.request_id],
+                    cadence_boundary=item.cadence_boundary,
+                    computed_tokens=item.computed_tokens,
+                    retained_tokens=item.retained_tokens,
+                    page_size=item.page_size,
+                    block_ids=tuple(debug_ids[row]) if debug_ids is not None else None,
+                    scores=tuple(debug_scores[row])
+                    if debug_scores is not None
+                    else None,
+                    victim_indices=tuple(indices[row]),
+                    victim_block_ids=tuple(ids[row]),
+                )
+        for item in pending:
+            del self._pending_scores[item.request_id, item.layer_name]
+        return [proposal for proposal in result if proposal is not None]
+
     def take_proposals(
         self, table_versions: dict[str, int], layer_names: list[str]
     ) -> list[NGCEvictionProposal]:
+        batched = self._take_batched_proposals(table_versions, layer_names)
         pending = []
         for req_id, version in table_versions.items():
             for layer_name in layer_names:
@@ -708,7 +826,7 @@ class NGCScoringBuffers:
                     continue
                 pending.append((req_id, layer_name, version, history.decision))
         if not pending:
-            return []
+            return batched
         tensors: list[torch.Tensor] = [
             torch.stack(
                 [
@@ -759,7 +877,7 @@ class NGCScoringBuffers:
             )
         for req_id, layer_name, _, _ in pending:
             self.histories[req_id, layer_name].decision = None
-        return proposals
+        return batched + proposals
 
     def get_queries(self, req_id: str, layer_name: str):
         """Return the layer's most recent queries and positions, oldest first."""
@@ -864,6 +982,7 @@ class NGCScoringBuffers:
         reduce_scores: Callable[[torch.Tensor], torch.Tensor] | None = None,
         prepared: NGCPreparedScoreInput | None = None,
         precomputed_scores: torch.Tensor | None = None,
+        defer_selection: bool = False,
     ) -> NGCEvictionDecision | None:
         """Score retained keys and save a proposal at the next due boundary.
 
@@ -902,6 +1021,37 @@ class NGCScoringBuffers:
             scores = reduce_scores(scores)
         if block_ids.device != scores.device:
             raise ValueError("NGC block IDs and scores must share a device")
+        if defer_selection:
+            if page_size <= 0 or retained_tokens < 0 or min_retained_tokens <= 0:
+                raise ValueError("Invalid NGC page size or retained-token budget")
+            if not 0 <= eviction_rate < 1:
+                raise ValueError("NGC eviction_rate must be in [0, 1)")
+            pages = scores.numel()
+            if (
+                scores.ndim != 1
+                or block_ids.shape != scores.shape
+                or pages != (retained_tokens + page_size - 1) // page_size
+            ):
+                raise ValueError("Expected matching page score and block ID vectors")
+            count = min(
+                floor(eviction_rate * max(pages - 1, 0)),
+                max((retained_tokens - min_retained_tokens) // page_size, 0),
+            )
+            self.histories.pop((req_id, layer_name), None)
+            self._pending_scores[req_id, layer_name] = NGCPendingScore(
+                req_id,
+                layer_name,
+                group_id,
+                boundary,
+                computed_tokens,
+                retained_tokens,
+                page_size,
+                count,
+                scores,
+                block_ids,
+            )
+            self._scored_boundaries[req_id, layer_name] = boundary
+            return None
         victims = select_ngc_victims(
             scores,
             retained_tokens,
@@ -928,6 +1078,8 @@ class NGCScoringBuffers:
         return decision
 
     def discard_request(self, req_id: str, *, keep_cadence: bool = False) -> None:
+        for key in [key for key in self._pending_scores if key[0] == req_id]:
+            del self._pending_scores[key]
         for key in list(self.histories):
             if key[0] == req_id:
                 del self.histories[key]

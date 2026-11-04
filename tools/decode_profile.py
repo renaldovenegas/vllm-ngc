@@ -7,6 +7,7 @@ import contextlib
 import csv
 import functools
 import gzip
+import hashlib
 import inspect
 import io
 import json
@@ -350,6 +351,32 @@ def observe_fused_steps(enabled):
         GPUModelRunner._prepare_ngc_fused_decode = original
 
 
+def output_digests(requests, initial_counts, request_indices):
+    """Hash CPU token IDs by canonical batch index, outside the decode timer."""
+    rows = []
+    for request in sorted(requests, key=lambda r: request_indices[r.request_id]):
+        tokens = list(request.output_token_ids)
+        measured = tokens[initial_counts[request.request_id] :]
+        digest = lambda values: hashlib.sha256(
+            json.dumps(values, separators=(",", ":")).encode()
+        ).hexdigest()
+        rows.append(
+            {
+                "request_index": request_indices[request.request_id],
+                "full_length": len(tokens),
+                "window_length": len(measured),
+                "full_sha256": digest(tokens),
+                "window_sha256": digest(measured),
+            }
+        )
+    return {
+        "sha256": hashlib.sha256(
+            json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "requests": rows,
+    }
+
+
 def run(args):
     import torch
 
@@ -403,6 +430,7 @@ def run(args):
         ignore_eos=args.ignore_eos,
     )
     serial = 0
+    request_indices = {}
 
     def active_requests():
         requests = list(scheduler.requests.values())
@@ -419,10 +447,14 @@ def run(args):
         return requests
 
     def prepare():
-        nonlocal serial
+        nonlocal serial, request_indices
         serial += 1
+        request_indices = {}
         for i in range(args.batch_size):
-            engine.add_request(f"{serial}-{i}", {"prompt_token_ids": tokens}, params)
+            internal_id = engine.add_request(
+                f"{serial}-{i}", {"prompt_token_ids": tokens}, params
+            )
+            request_indices[internal_id] = i
         while True:
             engine.step()
             requests = active_requests()
@@ -445,7 +477,10 @@ def run(args):
         lengths = [r.num_computed_tokens for r in active_requests()]
         if len(lengths) != args.batch_size:
             raise RuntimeError("Incomplete batch before measurement")
-        initial = sum(r.num_output_tokens for r in scheduler.requests.values())
+        initial_counts = {
+            r.request_id: r.num_output_tokens for r in scheduler.requests.values()
+        }
+        initial = sum(initial_counts.values())
         annotation = (
             torch.profiler.record_function("DecodeProfile.window")
             if label
@@ -515,6 +550,7 @@ def run(args):
             raise RuntimeError("Zero-rate NGC unexpectedly evicted tokens")
         kinds = sorted({row["kind"] for row in step_rows})
         return {
+            "output_digests": output_digests(requests, initial_counts, request_indices),
             "retained_before": before,
             "retained_after": after,
             "profiled_steps": step_rows,

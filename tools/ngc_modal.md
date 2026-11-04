@@ -499,3 +499,26 @@ warmup/generation, so an H100 has sufficient headroom for this model.
 The preset collects uninstrumented timing and a separate trace for all three
 cases. Optional hardware counters remain disabled. Summaries and artifact download
 instructions use the same `decode-profile-<id>` output directories described above.
+
+## CPU optimization before/after comparison
+
+The `ngc-cpu-baseline` branch preserves the pre-optimization snapshot, including
+shared cadence checks. The `ngc-cpu-optimization` branch batches score selection
+and handoff, skips empty non-debug proposals, reuses unchanged position metadata,
+and avoids unchanged eviction-offset uploads. Immutable per-layer proposals and
+scheduler validation remain intact; allocator freeing was already batched.
+
+```bash
+DECODE_PROFILE_GPU=H100 \
+DECODE_PROFILE_BEFORE_DIR="$PWD/.ngc-modal-results/worktrees/ngc-cpu-baseline" \
+  .venv/bin/modal run --detach tools/ngc_24k_modal.py::compare_ab
+```
+
+The comparison uses Qwen2.5-0.5B-Instruct, batch 48, 24,576 prompt tokens, cadence
+256, query window 5, and 768 measured decode steps. It alternates before/after
+order across three rounds at both 0% and 75% eviction. Each arm has a separate
+process and compilation cache, with a matching warmup before measurement.
+Generated-token hashes are compared at each rate outside the timing window.
+These default AB runs collect unprofiled timing; the generic profiler also
+supports optional traces. This measures the same repeated-eviction workload as
+the earlier 24K experiment, not fixed 6K retention.

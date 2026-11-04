@@ -14,6 +14,7 @@ from uuid import uuid4
 import modal
 
 GPU = os.environ.get("DECODE_PROFILE_GPU", "H100")
+BEFORE_DIR = os.environ.get("DECODE_PROFILE_BEFORE_DIR")
 INSTALL_NCU = os.environ.get("DECODE_PROFILE_NCU", "0") == "1"
 image = None
 if modal.is_local():
@@ -43,6 +44,15 @@ if modal.is_local():
             "**/_version.py",
         ],
     )
+    if BEFORE_DIR:
+        before_path = Path(BEFORE_DIR).resolve()
+        if not (before_path / "vllm").is_dir():
+            raise ValueError("DECODE_PROFILE_BEFORE_DIR must contain a vllm directory")
+        image = image.add_local_dir(
+            before_path / "vllm",
+            "/ngc-before-source/vllm",
+            ignore=["**/__pycache__/**", "**/*.pyc", "**/*.so", "**/_version.py"],
+        )
     image = image.add_local_file(ROOT / "tools/decode_profile.py", "/profile/runner.py")
     image = image.add_local_file(
         ROOT / "tools/decode_profile_modal.py", "/profile/modal.py"
@@ -98,6 +108,60 @@ def build_ncu_command(command, folder, module):
     ]
 
 
+def tree_digest(root):
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            digest.update(str(path.relative_to(root)).encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def policy_settings(policy):
+    """Resolve source arm, eviction rate and a stable result-directory name."""
+    if policy in {"full", "upstream"}:
+        return policy, None, policy
+    arm, value = policy.split(":", 1) if ":" in policy else ("after", policy)
+    if arm not in {"before", "after"}:
+        raise ValueError("Source arm must be before or after")
+    rate = float(value)
+    if not 0 <= rate < 1:
+        raise ValueError("Eviction fractions must be in [0, 1)")
+    label = f"{arm}-{rate:g}" if ":" in policy else f"ngc-{rate:g}"
+    return arm, rate, label
+
+
+def comparison_rows(cases):
+    """Pair equal-rate before/after outputs and decode-window timings."""
+    pairs = {}
+    for case in cases:
+        arm, rate, _ = policy_settings(case["policy"])
+        if arm not in {"before", "after"} or "timing" not in case:
+            continue
+        key = (case["context"], rate, case.get("round", 1))
+        pairs.setdefault(key, {})[arm] = case
+    result = []
+    for (context, rate, round_index), pair in pairs.items():
+        if set(pair) != {"before", "after"}:
+            continue
+        before, after = (pair[arm]["timing"]["runs"] for arm in ("before", "after"))
+        match = len(before) == len(after) and all(
+            a["output_digests"]["sha256"] == b["output_digests"]["sha256"]
+            for a, b in zip(before, after)
+        )
+        result.append(
+            {
+                "context": context,
+                "eviction_rate": rate,
+                "round": round_index,
+                "output_hashes_match": match,
+                "before_seconds": [r["seconds"] for r in before],
+                "after_seconds": [r["seconds"] for r in after],
+            }
+        )
+    return result
+
+
 @app.function(
     image=image,
     gpu=GPU,
@@ -115,6 +179,12 @@ def profile(config: dict):
     upstream_root = Path("/opt/decode-profile-upstream")
     if "upstream" in config["policies"]:
         shutil.copytree(REMOTE_ROOT / "vllm", upstream_root / "vllm")
+    before_root = Path("/opt/decode-profile-before")
+    if any(policy_settings(p)[0] == "before" for p in config["policies"]):
+        shutil.copytree(REMOTE_ROOT / "vllm", before_root / "vllm")
+        shutil.copytree(
+            "/ngc-before-source/vllm", before_root / "vllm", dirs_exist_ok=True
+        )
     # Same source-overlay convention as ngc_modal; retain compiled release binaries.
     shutil.copytree("/ngc-source/vllm", REMOTE_ROOT / "vllm", dirs_exist_ok=True)
     spec = spec_from_file_location("decode_profile", "/profile/runner.py")
@@ -133,6 +203,11 @@ def profile(config: dict):
         "run_id": run_id,
         "source_sha256": {
             "vllm_tree": source.hexdigest(),
+            "before_vllm_tree": (
+                tree_digest(Path("/ngc-before-source/vllm"))
+                if config.get("before_commit")
+                else None
+            ),
             "runner": hashlib.sha256(
                 Path("/profile/runner.py").read_bytes()
             ).hexdigest(),
@@ -164,25 +239,61 @@ def profile(config: dict):
         cache.commit()
 
     save()
-    for context, policy in itertools.product(config["contexts"], config["policies"]):
-        rate = None if policy in {"full", "upstream"} else float(policy)
-        folder = (
-            root / f"context-{context}" / (policy if rate is None else f"ngc-{rate:g}")
+    rounds = config["repeats"] if config.get("interleave_repeats") else 1
+    jobs = []
+    for round_index in range(rounds):
+        policies = config["policies"]
+        if round_index % 2:
+            policies = list(reversed(policies))
+        jobs.extend(
+            (context, policy, round_index + 1)
+            for context, policy in itertools.product(config["contexts"], policies)
         )
+    for context, policy, round_index in jobs:
+        arm, rate, label = policy_settings(policy)
+        folder = root / f"context-{context}" / label
+        if config.get("interleave_repeats"):
+            folder = folder / f"round-{round_index}"
         folder.mkdir(parents=True)
         case = {
             "context": context,
+            "round": round_index,
             "policy": policy,
             "eviction_rate": rate,
             "status": "running",
         }
-        source_root = upstream_root if policy == "upstream" else REMOTE_ROOT
+        print(
+            f"CASE_START policy={policy} round={round_index} context={context}",
+            flush=True,
+        )
+        source_root = (
+            upstream_root
+            if arm == "upstream"
+            else before_root
+            if arm == "before"
+            else REMOTE_ROOT
+        )
         case["source_root"] = str(source_root / "vllm")
+        case["source_tree_sha256"] = (
+            report["source_sha256"]["before_vllm_tree"]
+            if arm == "before"
+            else report["source_sha256"]["vllm_tree"]
+            if arm != "upstream"
+            else None
+        )
         case["source_commit"] = (
-            BASE_COMMIT if policy == "upstream" else config["checkout_commit"]
+            BASE_COMMIT
+            if arm == "upstream"
+            else config["before_commit"]
+            if arm == "before"
+            else config["checkout_commit"]
         )
         case["source_kind"] = (
-            "pristine_upstream" if policy == "upstream" else "working_tree_overlay"
+            "pristine_upstream"
+            if arm == "upstream"
+            else "before_snapshot"
+            if arm == "before"
+            else "working_tree_overlay"
         )
         report["cases"].append(case)
         command = [
@@ -199,7 +310,7 @@ def profile(config: dict):
             "--warmup-steps",
             str(config["warmup_steps"]),
             "--repeats",
-            str(config["repeats"]),
+            str(1 if config.get("interleave_repeats") else config["repeats"]),
             "--dtype",
             config["dtype"],
             "--backend",
@@ -223,7 +334,7 @@ def profile(config: dict):
         process_env = dict(
             os.environ,
             PYTHONPATH=str(source_root),
-            VLLM_CACHE_ROOT=f"/cache/vllm-decode-profile/{folder.name}",
+            VLLM_CACHE_ROOT=f"/cache/vllm-decode-profile/{label}",
         )
         case["process_environment"] = {
             key: process_env[key] for key in ("PYTHONPATH", "VLLM_CACHE_ROOT")
@@ -244,13 +355,18 @@ def profile(config: dict):
                     print(line, end="", flush=True)
                 return process.wait()
 
-        for mode in ("timing", "trace"):
+        for mode in ("timing",) if config.get("timing_only") else ("timing", "trace"):
             code = execute(command + ["--mode", mode], mode)
             if code:
                 case.update(status="failed", phase=mode, returncode=code)
                 save()
                 break
             case[mode] = json.loads((folder / f"{mode}.json").read_text())
+            print(
+                f"CASE_DONE policy={policy} round={round_index} mode={mode} "
+                f"ms_per_step={case[mode]['median_ms_per_decode_step']:.6f}",
+                flush=True,
+            )
             if mode == "trace":
                 case["timeline"] = json.loads((folder / "timeline.json").read_text())
             save()
@@ -306,6 +422,10 @@ def profile(config: dict):
                 json.dumps(case["counters"], indent=2)
             )
         save()
+    report["before_after_comparisons"] = comparison_rows(report["cases"])
+    report["output_equivalence_passed"] = all(
+        row["output_hashes_match"] for row in report["before_after_comparisons"]
+    )
     report["counter_collection_status"] = (
         "not_requested"
         if not config["counters"]
@@ -314,7 +434,10 @@ def profile(config: dict):
         else "partial_or_unavailable"
     )
     report["status"] = (
-        "complete" if all(c["status"] == "ok" for c in report["cases"]) else "failed"
+        "complete"
+        if all(c["status"] == "ok" for c in report["cases"])
+        and report["output_equivalence_passed"]
+        else "failed"
     )
     save()
     return {"run_id": run_id, "summary": report}
@@ -337,14 +460,27 @@ def main(
     counters: bool = False,
     ignore_eos: bool = False,
     submit_only: bool = False,
+    interleave_repeats: bool = False,
+    timing_only: bool = False,
 ):
     selected = list(dict.fromkeys(value.strip() for value in policies.split(",")))
-    for policy in selected:
-        if policy not in {"full", "upstream"} and not 0 <= float(policy) < 1:
+    settings = [policy_settings(policy) for policy in selected]
+    before_commit = None
+    if any(arm == "before" for arm, _, _ in settings):
+        if not BEFORE_DIR:
             raise ValueError(
-                "Policies must be full, upstream, or eviction fractions in [0, 1)"
+                "Set DECODE_PROFILE_BEFORE_DIR before importing this recipe"
             )
-    ngc = any(policy not in {"full", "upstream"} for policy in selected)
+        before_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=BEFORE_DIR, text=True
+        ).strip()
+        subprocess.run(
+            ["git", "diff", "--exit-code", "HEAD", "--", "vllm"],
+            cwd=BEFORE_DIR,
+            check=True,
+            capture_output=True,
+        )
+    ngc = any(rate is not None for _, rate, _ in settings)
     if cadence <= 0 or not 1 <= query_window <= cadence:
         raise ValueError("Require 1 <= query-window <= cadence")
     if ngc and backend != "TRITON_ATTN":
@@ -363,6 +499,9 @@ def main(
         raise ValueError("Launch with DECODE_PROFILE_NCU=1 to install Nsight Compute")
     config = dict(
         model=model,
+        before_commit=before_commit,
+        interleave_repeats=interleave_repeats,
+        timing_only=timing_only,
         policies=selected,
         cadence=cadence,
         query_window=query_window,

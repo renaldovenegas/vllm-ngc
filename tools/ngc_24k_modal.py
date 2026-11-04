@@ -27,3 +27,30 @@ def compare(repeats: int = 3, steps: int = 768, submit_only: bool = False):
         ignore_eos=True,
         submit_only=submit_only,
     )
+
+
+@app.local_entrypoint()
+def compare_ab(
+    repeats: int = 3, steps: int = 768, trace: bool = False, upstream: bool = False
+):
+    """Interleave committed before/current policies on one GPU allocation.
+
+    Set DECODE_PROFILE_BEFORE_DIR to the baseline worktree before launching.
+    """
+    profile_main(
+        model="Qwen/Qwen2.5-0.5B-Instruct",
+        contexts="24576",
+        batch_size=48,
+        policies=("upstream," if upstream else "")
+        + "before:0,after:0,before:0.75,after:0.75",
+        backend="TRITON_ATTN",
+        dtype="bfloat16",
+        cadence=256,
+        query_window=5,
+        steps=steps,
+        warmup_steps=16,
+        repeats=repeats,
+        ignore_eos=True,
+        interleave_repeats=True,
+        timing_only=not trace,
+    )
