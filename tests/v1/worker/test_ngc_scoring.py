@@ -73,7 +73,7 @@ def test_ngc_handoff_batches_layers_and_preserves_snapshots(
     assert not buffers.take_proposals({"a": 42}, ["0", "1"])
 
 
-def _ring_buffers(window, layers=("layer.0",), num_slots=4):
+def _ring_buffers(window, layers=("layer.0",), num_slots=4, cadences=None):
     buffers = NGCScoringBuffers()
     buffers.allocate(
         {name: (window, 1, 1) for name in layers},
@@ -81,6 +81,7 @@ def _ring_buffers(window, layers=("layer.0",), num_slots=4):
         max_num_tokens=512,
         dtype=torch.float32,
         device=torch.device("cpu"),
+        cadences=cadences,
     )
     return buffers
 
@@ -273,6 +274,60 @@ def test_due_filter_checks_each_request_boundary_once():
     assert not buffers.any_due("a", 256, 128)
     buffers.discard_request("a")
     assert buffers.any_due("a", 128, 128)
+
+
+def test_cadence_plan_snapshots_requests_without_consuming_boundaries():
+    """One shared plan survives length-buffer changes and request reordering."""
+    buffers = _ring_buffers(1)
+    assert buffers.any_due("a", 8, 8)
+    lengths = np.array([17, 9, 7, 999], dtype=np.int32)
+    checks = buffers.plan_cadences(["a", "b", "c"], lengths, {8, 16})
+    lengths[:] = 100
+    assert [
+        (check.req_index, check.req_id, check.seq_len, check.due_boundaries)
+        for check in checks
+    ] == [
+        (0, "a", 17, {8: 16, 16: 16}),
+        (1, "b", 9, {8: 8}),
+        (2, "c", 7, {}),
+    ]
+    assert buffers.any_due("a", 16, 8, mark_checked=False)
+    assert buffers.any_due("b", 8, 8, mark_checked=False)
+    for check in checks:
+        buffers.mark_cadences_checked(check)
+    reordered = buffers.plan_cadences(["b", "a"], np.array([16, 17]), {8, 16})
+    assert reordered[0].due_boundaries == {8: 16, 16: 16}
+    assert reordered[1].due_boundaries == {}
+    assert not buffers.plan_cadences(["a"], np.array([100]), set())
+
+
+@pytest.mark.parametrize("mode", ["NONE", "PIECEWISE"])
+def test_cadence_plan_preserves_crossed_prefill_capture_until_commit(mode, monkeypatch):
+    """Planning before forward must not suppress the crossed boundary's queries."""
+    from types import SimpleNamespace
+
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker import ngc_scoring
+
+    monkeypatch.setattr(ngc_scoring, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        ngc_scoring,
+        "get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=getattr(CUDAGraphMode, mode)),
+    )
+    buffers = _ring_buffers(3, cadences={"layer.0": 8})
+    _step(buffers, [("a", 0, 6)])
+    check = buffers.plan_cadences(["a"], np.array([11]), {8})[0]
+    assert check.due_boundaries == {8: 8}
+    _step(buffers, [("a", 6, 5)])
+    assert _queries(buffers, "a") == ([8, 9, 10], [8, 9, 10])
+    buffers.mark_cadences_checked(check)
+    assert buffers.plan_cadences(["a"], np.array([11]), {8})[0].due_boundaries == {}
+    # Request-level consumption must not suppress an unscored layer's safety check.
+    assert buffers.due_boundary("a", "layer.0", 11, 8) == 8
+    assert buffers.plan_cadences(["a"], np.array([16]), {8})[0].due_boundaries == {
+        8: 16
+    }
 
 
 @pytest.mark.parametrize(

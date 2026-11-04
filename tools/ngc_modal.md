@@ -342,3 +342,160 @@ each case's `smoke.json` include the prompt, sampling settings, token counts,
 finish reasons, and eviction instrumentation. Each completed case is checkpointed
 to the Modal volume. With `--detach`, the remote job survives client disconnects;
 automatic local download still requires the client to remain connected.
+
+## Full-attention and NGC decode profiling
+
+`tools/decode_profile_modal.py` compares full attention against NGC with 0%, 50%,
+and 75% eviction by default. It reuses the pinned Modal environment above and
+supports one GPU, synchronous scheduling, FP16/BF16, and CUDA graphs or eager
+execution. Speculative decoding is disabled. All comparison cases use Triton
+attention, including full attention, to avoid mixing backend effects with eviction.
+The full baseline is this checkout with NGC disabled, not a pristine upstream build.
+
+```bash
+DECODE_PROFILE_GPU=H100 .venv/bin/modal run --detach tools/decode_profile_modal.py \
+  --model Qwen/Qwen3-8B --batch-size 1 --contexts 512,2048,8192 \
+  --policies full,0,0.5,0.75 --backend TRITON_ATTN \
+  --cadence 256 --query-window 5 \
+  --steps 768 --warmup-steps 16 --repeats 3 --ignore-eos
+```
+
+The input is a synthetic, exact-length token sequence, not a quality evaluation.
+Normal EOS is respected by default. If any sequence finishes inside the selected
+window, the script rejects the measurement rather than silently timing a smaller
+batch. For controlled fixed-shape profiling, explicitly add `--ignore-eos`.
+Use `--batch-size 48` for a larger batch or `--eager` to disable compilation/graphs.
+Use `--policies full --backend FLASH_ATTN --steps 64` to reproduce the earlier
+full-attention-only setup. The new default Triton baseline is not directly
+comparable to the earlier FlashAttention baseline.
+
+Policies are `full` or fractions removed at each boundary, not target cache
+occupancies. NGC 0% retains scoring/bookkeeping while removing no tokens. Each
+NGC policy applies to all decoder attention layers with a minimum retention of
+32 tokens. The cadence and query window are shared across layers. NGC comparisons
+require at least two cadences of measured decode; the default 768 steps spans
+three cadence intervals. Positive-rate runs fail if no actual eviction occurs.
+
+Each context/policy pair has separate processes for three measurements:
+
+| Artifact | Measurement |
+| --- | --- |
+| `timing.json` | Unprofiled decode wall time, excluding prefill and warmup; per-step latency and aggregate cost per output token |
+| `timeline.json`, `trace.json.gz` | CPU/CUDA timeline; attention, GEMMs, normalization, cache writes, other kernels, synchronization APIs and GPU gaps |
+| `hardware.json`, `ncu.csv`, `attention.ncu-rep` | Optional measured attention DRAM traffic and compute/activity counters |
+
+The runner first warms a matching generation, then prefills each new request
+outside the measured window and performs the configured decode warmup steps.
+Context grows during measurement; reports record the actual context range.
+Per-step latency corresponds to one new token per active request. Aggregate
+milliseconds per token divides by the total number of tokens across the batch.
+Do not confuse the latter with per-request latency. Retained KV lengths are
+recorded per request and cache group before and after the measured window;
+these count committed tokens, not padded block capacity. Requests start fresh
+for each repeat, so this measures cache evolution from the selected prompt,
+not a permanently stabilized retained context.
+
+The separate trace pass records per-step diagnostics in `trace.json` and the
+summary: ordinary decode, fused scoring, pending proposal application, or both.
+Proposal application can remove zero tokens, particularly at 0% eviction.
+`profiled_step_summary` reports counts and mean wall time by kind. These diagnostic
+timings include profiler overhead and an added GPU synchronization per step;
+use the uninstrumented `timing.json` medians for end-to-end comparisons.
+Per-step retained-length ranges and actual removal totals are also recorded.
+Removal totals sum across cache groups and are not unique token counts.
+Fused decode/scoring kernels belong to attention time because their two costs
+cannot be separated from the fused launch.
+
+To request hardware counters, install the pinned Nsight Compute CLI in the image
+and enable the counter pass:
+
+```bash
+DECODE_PROFILE_GPU=H100 DECODE_PROFILE_NCU=1 \
+  .venv/bin/modal run --detach tools/decode_profile_modal.py \
+  --contexts 512,2048,8192 --batch-size 1 --ignore-eos --counters
+```
+
+Hardware collection selects attention kernels inside the first warmed decode
+step. For NGC this may be an ordinary step; it does not guarantee capturing a
+scoring boundary and must not be interpreted as an average over an eviction cycle.
+It requests measured DRAM read/write bytes, kernel duration, DRAM and SM
+throughput percentages, tensor-pipeline activity and achieved occupancy. DRAM
+traffic includes every access by the selected kernel, not only KV reads; cache
+hits matter. Activity percentages are not model FLOP/s. Nsight replay and kernel
+serialization perturb execution, so counter-pass durations must not replace
+the unprofiled timing results. Cache flushing and clock control are disabled;
+the exact invocation is saved beside the report. Collecting all attention layers
+can take many minutes even for a single decode step because metrics require
+repeated kernel replay.
+
+Modal GPU counter permissions and architecture-specific metric availability are
+not guaranteed. Missing counters are marked unavailable/partial with raw logs,
+never replaced with theoretical KV bytes or `nvidia-smi` utilization. The timing
+and timeline passes remain useful when counters are unavailable.
+
+Kernel categories use explicit name matching and retain all unknown kernels.
+Generic GEMMs are grouped together: projections, MLPs and the language-model head
+cannot reliably be separated by kernel name. GPU intervals are unioned, but
+different categories may still overlap each other. Host API spans overlap GPU
+work. Gaps show inactivity, not its cause; inspect the trace before attributing
+them to launch starvation. TP=1 has no inter-GPU model communication; this script
+does not claim to measure distributed communication performance.
+
+Each completed phase is committed to the `vllm-ngc-test-cache` volume under
+`results/decode-profile-<id>/`. The local client saves `summary.json` and prints
+the command to download the full directory, including traces. `--submit-only`
+returns immediately with a Modal function-call ID; use the Modal app logs to
+locate the result directory. Detached execution survives client disconnects,
+but automatic summary download requires the local client to remain connected.
+
+## Isolated decode versus fused scoring
+
+`tools/ngc_decode_profile_modal.py` compares standard Triton decode against fused
+NGC decode/scoring on identical synthetic Q/K/V tensors and page tables. It uses
+Qwen3-8B attention dimensions, BF16, a five-query scoring window, and production
+launch settings. It measures one attention layer, excluding the model's other
+operations, scheduler, input preparation, and eviction bookkeeping.
+
+```bash
+NGC_DECODE_GPU=H100 .venv/bin/modal run --detach tools/ngc_decode_profile_modal.py \
+  --batches 1,48 --contexts 512,2048,8192
+```
+
+Decode outputs and page scores are checked before timing. GPU timing uses CUPTI
+with CUDA graphs and cold L2; a separate profiler pass attributes time to each
+kernel stage. Kernel timings exclude compilation and allocations. Estimated KV
+traffic is a theoretical lower bound, not a hardware measurement of actual DRAM
+bytes. The results test the incremental cost of scoring at a cadence boundary;
+they do not directly predict end-to-end model speedup or prove a bandwidth limit.
+
+The client downloads the summary, metadata and log to
+`.ngc-modal-results/ngc-decode-kernels-<id>/`; all artifacts also persist in the
+`vllm-ngc-test-cache` Modal volume.
+
+## Qwen2.5-0.5B at batch 48 and a 24K prompt
+
+```bash
+DECODE_PROFILE_GPU=H100 .venv/bin/modal run --detach tools/ngc_24k_modal.py::compare
+```
+
+This preset compares pristine upstream at the pinned base commit against NGC 0%
+and NGC 75% with Qwen2.5-0.5B-Instruct, BF16, Triton attention, CUDA graphs,
+batch 48, cadence 256 and query window 5. Each request gets exactly 24,576 prompt
+tokens. After prefill and 16 warmup steps, every request generates 768 measured
+tokens; EOS is ignored to maintain the same fixed batch. Prefill is excluded from
+decode timing. `--steps` and `--repeats` override the default 768 and 3. Total output
+includes untimed warmup and any decode during other requests' chunked prefill;
+actual context ranges are saved in the summary.
+
+The upstream package is copied from the pristine pinned installation before the
+fork's Python overlay is applied. Each policy runs in a separate process with an
+explicit import path, and the runner checks that the imported package matches the
+requested source. This is upstream at the fork's base commit, not latest upstream.
+The 24K value is prompt length, not generation length or retained cache size after
+eviction. A 75% rate removes eligible pages at each boundary rather than fixing
+retention at 6K tokens. The full baseline needs about 13.5 GiB of BF16 KV before
+warmup/generation, so an H100 has sufficient headroom for this model.
+
+The preset collects uninstrumented timing and a separate trace for all three
+cases. Optional hardware counters remain disabled. Summaries and artifact download
+instructions use the same `decode-profile-<id>` output directories described above.

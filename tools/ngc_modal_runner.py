@@ -457,6 +457,8 @@ def main() -> None:
             "speed-long",
             "speed-upstream",
             "upstream-check",
+            "dflash-speed",
+            "dflash-math500",
             "scheduler-ab",
             "metadata-ab",
             "speed-eviction",
@@ -478,6 +480,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--eviction-rate", type=float, default=0.25)
+    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--thinking", action="store_true")
     parser.add_argument("--result-dir", type=Path, required=True)
     args = parser.parse_args()
     if not 0 <= args.eviction_rate < 1:
@@ -513,6 +517,22 @@ def main() -> None:
                 ],
                 check=True,
             )
+        return
+    if args.job in {"dflash-speed", "dflash-math500"}:
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("dflash_modal_benchmark.py")),
+                "--result-dir",
+                str(args.result_dir),
+                "--workload",
+                "math500" if args.job == "dflash-math500" else "story",
+                "--max-tokens",
+                str(args.max_tokens),
+                *(["--thinking"] if args.thinking else []),
+            ],
+            check=True,
+        )
         return
     if args.job == "upstream-check":
         subprocess.run(

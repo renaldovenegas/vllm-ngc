@@ -214,6 +214,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunne
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ngc_cudagraph import NGCBoundaryGraph
 from vllm.v1.worker.ngc_scoring import (
+    NGCCadenceCheck,
     NGCPreparedScoreInput,
     NGCScoreInput,
     NGCScoringBuffers,
@@ -4145,8 +4146,9 @@ class GPUModelRunner(
             logits_indices, spec_decode_metadata, max_num_sampled_tokens = (
                 self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
             )
+            ngc_cadences = self._plan_ngc_cadences(num_reqs)
             ngc_fused_boundary = self._prepare_ngc_fused_decode(
-                num_reqs, max_num_scheduled_tokens
+                num_reqs, max_num_scheduled_tokens, ngc_cadences
             )
 
             (
@@ -4353,7 +4355,7 @@ class GPUModelRunner(
                     self.ngc_scoring_buffers.publish_fused_graph_scores()
             else:
                 model_output = self._model_forward(**forward_kwargs)
-            self._score_ngc_pages(num_reqs)
+            self._score_ngc_pages(num_reqs, ngc_cadences)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -7313,26 +7315,30 @@ class GPUModelRunner(
             [layer.kv_cache for _, layer in self._ngc_scoring_layers],
         )
 
-    def _prepare_ngc_fused_decode(self, num_reqs: int, max_query_len: int) -> bool:
-        buffers = self.ngc_scoring_buffers
-        buffers.reset_fused_decode()
-        if max_query_len != 1 or not self._ngc_scoring_layers:
-            return False
+    def _plan_ngc_cadences(self, num_reqs: int) -> list[NGCCadenceCheck]:
+        if not self._ngc_scoring_layers:
+            return []
         cadences = {
             policy.cadence
             for _, layer in self._ngc_scoring_layers
             if (policy := layer.ngc_eviction_config) is not None
         }
-        request_info = []
-        pending_cadences: set[int] = set()
-        for index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            seq_len = int(self.optimistic_seq_lens_cpu[index])
-            pending_cadences.update(
-                cadence
-                for cadence in cadences
-                if buffers.any_due(req_id, seq_len, cadence, mark_checked=False)
-            )
-            request_info.append((index, req_id, seq_len))
+        return self.ngc_scoring_buffers.plan_cadences(
+            self.input_batch.req_ids[:num_reqs],
+            self.optimistic_seq_lens_cpu.numpy(),
+            cadences,
+        )
+
+    def _prepare_ngc_fused_decode(
+        self, num_reqs: int, max_query_len: int, checks: list[NGCCadenceCheck]
+    ) -> bool:
+        buffers = self.ngc_scoring_buffers
+        buffers.reset_fused_decode()
+        if max_query_len != 1 or not self._ngc_scoring_layers:
+            return False
+        pending_cadences = {
+            cadence for check in checks for cadence in check.due_boundaries
+        }
         if not pending_cadences:
             return False
         inputs = []
@@ -7351,7 +7357,8 @@ class GPUModelRunner(
             ):
                 continue
             requests = []
-            for index, req_id, seq_len in request_info:
+            for check in checks:
+                index, req_id, seq_len = check.req_index, check.req_id, check.seq_len
                 is_due = (
                     buffers.due_boundary(
                         req_id, layer.layer_name, seq_len, policy.cadence
@@ -7391,28 +7398,22 @@ class GPUModelRunner(
             buffers.prepare_fused_decode(inputs, due)
         return bool(inputs)
 
-    def _score_ngc_pages(self, num_reqs: int) -> None:
+    def _score_ngc_pages(self, num_reqs: int, checks: list[NGCCadenceCheck]) -> None:
         """Score retained keys using their original positions after KV writes."""
         buffers = self.ngc_scoring_buffers
-        policies = [layer.ngc_eviction_config for _, layer in self._ngc_scoring_layers]
-        cadences = sorted({policy.cadence for policy in policies if policy is not None})
         pending = []
         score_inputs = []
         score_tables = {}
-        for req_index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            seq_len = int(self.optimistic_seq_lens_cpu[req_index])
-            due = {
-                cadence
-                for cadence in cadences
-                if buffers.any_due(req_id, seq_len, cadence)
-            }
-            if not due:
+        for check in checks:
+            if not check.due_boundaries:
                 continue
+            buffers.mark_cadences_checked(check)
+            req_index, req_id, seq_len = check.req_index, check.req_id, check.seq_len
             layouts = self._ngc_layouts.get(req_id, {})
             for group_id, layer in self._ngc_scoring_layers:
                 policy = layer.ngc_eviction_config
                 assert policy is not None
-                if policy.cadence not in due:
+                if policy.cadence not in check.due_boundaries:
                     continue
                 if (
                     buffers.due_boundary(

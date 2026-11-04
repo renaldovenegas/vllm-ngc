@@ -64,7 +64,7 @@ cache = modal.Volume.from_name("vllm-ngc-test-cache", create_if_missing=True)
 
 # Keep source uploads after the cached installation layers. Runtime copies merge
 # with the installed checkout so mounted Python files never hide compiled modules.
-image = (
+runtime_image = (
     modal.Image.from_registry("python:3.12-slim-bookworm")
     .apt_install("git", "libnuma1", "libgomp1", "libgl1", "libglib2.0-0")
     .uv_pip_install("uv==0.10.12")
@@ -103,7 +103,9 @@ image = (
             "PYTHONUNBUFFERED": "1",
         }
     )
-    .add_local_dir(
+)
+image = (
+    runtime_image.add_local_dir(
         ROOT / "vllm",
         "/ngc-source/vllm",
         ignore=[
@@ -127,6 +129,9 @@ image = (
         "/ngc-source/test_gpu_input_batch.py",
     )
     .add_local_file(ROOT / "tools/ngc_modal_benchmark.py", "/ngc-source/benchmark.py")
+    .add_local_file(
+        ROOT / "tools/dflash_modal_benchmark.py", "/ngc-source/dflash_benchmark.py"
+    )
     .add_local_file(
         ROOT / "benchmarks/kernels/benchmark_ngc_metadata.py",
         "/ngc-source/metadata_benchmark.py",
@@ -157,6 +162,8 @@ def run_tests(
     revision: str,
     batch_size: int = 50,
     repeats: int = 1,
+    max_tokens: int = 1024,
+    thinking: bool = False,
 ) -> dict:
     source_hash = hashlib.sha256()
     for path in sorted(Path("/ngc-source").rglob("*")):
@@ -235,6 +242,9 @@ def run_tests(
     )
     shutil.copyfile("/ngc-source/benchmark.py", REMOTE_ROOT / "ngc_modal_benchmark.py")
     shutil.copyfile(
+        "/ngc-source/dflash_benchmark.py", REMOTE_ROOT / "dflash_modal_benchmark.py"
+    )
+    shutil.copyfile(
         "/ngc-source/metadata_benchmark.py", REMOTE_ROOT / "ngc_metadata_benchmark.py"
     )
     test_path = REMOTE_ROOT / "tests/kernels/attention/test_triton_unified_attention.py"
@@ -261,6 +271,9 @@ def run_tests(
         str(batch_size),
         "--repeats",
         str(repeats),
+        "--max-tokens",
+        str(max_tokens),
+        *(["--thinking"] if thinking else []),
     ]
     try:
         with (result_dir / "output.log").open("w") as log:
@@ -282,6 +295,8 @@ def run_tests(
         metadata = {
             "run_id": run_id,
             "job": job,
+            "generation_max_tokens": max_tokens if job.startswith("dflash-") else None,
+            "thinking": thinking if job.startswith("dflash-") else None,
             "batch_size": batch_size
             if job in {"speed-eviction", "speed-4k", "metadata-ab", "profile-4k"}
             else None,
@@ -314,7 +329,16 @@ def main(
     submit_only: bool = False,
     batch_size: int = 50,
     repeats: int = 1,
+    max_tokens: int = 1024,
+    thinking: bool = False,
 ):
+    if max_tokens <= 0:
+        raise ValueError("max-tokens must be positive")
+    if (thinking or max_tokens != 1024) and job not in {
+        "dflash-speed",
+        "dflash-math500",
+    }:
+        raise ValueError("thinking and max-tokens apply only to DFlash jobs")
     if repeats <= 0 or (repeats != 1 and job not in {"metadata-ab", "speed-4k"}):
         raise ValueError("positive --repeats applies only to metadata-ab and speed-4k")
     if batch_size <= 0:
@@ -340,6 +364,8 @@ def main(
         "speed-long",
         "speed-upstream",
         "upstream-check",
+        "dflash-speed",
+        "dflash-math500",
         "step-trace",
         "speed-batch",
         "graph-baseline",
@@ -363,11 +389,15 @@ def main(
     if job in {"scheduler-ab", "metadata-ab"} and not BEFORE_DIR:
         raise ValueError(f"{job} needs NGC_MODAL_BEFORE_DIR")
     if submit_only:
-        call = run_tests.spawn(job, selector, model, revision, batch_size, repeats)
+        call = run_tests.spawn(
+            job, selector, model, revision, batch_size, repeats, max_tokens, thinking
+        )
         print(f"Submitted function call: {call.object_id}")
         print("Results will persist in vllm-ngc-test-cache under results/.")
         return
-    result = run_tests.remote(job, selector, model, revision, batch_size, repeats)
+    result = run_tests.remote(
+        job, selector, model, revision, batch_size, repeats, max_tokens, thinking
+    )
     target = Path(output_dir) / result["metadata"]["run_id"]
     target.mkdir(parents=True, exist_ok=True)
     for name, contents in result["files"].items():

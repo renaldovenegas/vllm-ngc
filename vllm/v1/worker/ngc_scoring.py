@@ -40,6 +40,16 @@ def share_ngc_retained_lengths(
 
 
 @dataclass
+class NGCCadenceCheck:
+    """Per-forward request state shared by fused preparation and score handoff."""
+
+    req_index: int
+    req_id: str
+    seq_len: int
+    due_boundaries: dict[int, int]
+
+
+@dataclass
 class NGCPageScores:
     scores: torch.Tensor
     block_ids: torch.Tensor
@@ -760,6 +770,31 @@ class NGCScoringBuffers:
         rows = self._slots[req_id] * self._window + positions % self._window
         positions = positions.to(ring.device)
         return ring.index_select(0, rows.to(ring.device)), positions
+
+    def plan_cadences(
+        self,
+        req_ids: Sequence[str],
+        seq_lens: np.ndarray,
+        cadences: set[int],
+    ) -> list[NGCCadenceCheck]:
+        """Check each request/cadence once without consuming capture boundaries."""
+        if not cadences:
+            return []
+        checks = []
+        for index, req_id in enumerate(req_ids):
+            seq_len = int(seq_lens[index])
+            due = {}
+            for cadence in cadences:
+                boundary = seq_len // cadence * cadence
+                if boundary > self._checked_boundaries.get((req_id, cadence), 0):
+                    due[cadence] = boundary
+            checks.append(NGCCadenceCheck(index, req_id, seq_len, due))
+        return checks
+
+    def mark_cadences_checked(self, check: NGCCadenceCheck) -> None:
+        """Consume the planned boundaries after forward has captured queries."""
+        for cadence, boundary in check.due_boundaries.items():
+            self._checked_boundaries[check.req_id, cadence] = boundary
 
     def any_due(
         self,
