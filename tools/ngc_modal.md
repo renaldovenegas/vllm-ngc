@@ -522,3 +522,30 @@ Generated-token hashes are compared at each rate outside the timing window.
 These default AB runs collect unprofiled timing; the generic profiler also
 supports optional traces. This measures the same repeated-eviction workload as
 the earlier 24K experiment, not fixed 6K retention.
+
+### Persistent execution state comparison
+
+`ngc-persistent-execution` builds on `ngc-cpu-optimization` (`e4926fd48a`). It
+reuses request/layer score descriptors and their grouping, batches descriptor
+column updates, caches static layer settings, and skips reconstructing fused
+inputs after forward. Request removal and cache reinitialization invalidate the
+cached state; batch indices, lengths, block-table views, and page positions are
+refreshed before use. Scoring and eviction arithmetic are unchanged.
+
+With a clean worktree at the preceding commit, run a matched comparison with an
+upstream reference:
+
+```bash
+DECODE_PROFILE_GPU=H100 \
+DECODE_PROFILE_BEFORE_DIR="$PWD/.ngc-modal-results/worktrees/ngc-persistent-baseline" \
+  .venv/bin/modal run --detach tools/decode_profile_modal.py \
+  --model Qwen/Qwen2.5-0.5B-Instruct --contexts 24576 --batch-size 48 \
+  --steps 768 --warmup-steps 16 --repeats 2 --dtype bfloat16 \
+  --backend TRITON_ATTN --policies upstream,before:0,after:0,before:0.75,after:0.75 \
+  --cadence 256 --query-window 5 --ignore-eos --interleave-repeats \
+  --timing-only --submit-only
+```
+
+This submits ten timing windows on one GPU. The local launcher exits after
+submission; results persist in the Modal volume. Equal-rate before/after token
+hashes must match. Upstream is the pinned v0.32.0 release, not upstream HEAD.

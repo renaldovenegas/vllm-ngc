@@ -157,6 +157,13 @@ class NGCScoreInput:
     block_table: torch.Tensor
 
 
+@dataclass(frozen=True)
+class NGCLayerPlan:
+    page_size: int
+    kernel_page_size: int
+    fused_compatible: bool
+
+
 @dataclass
 class NGCPreparedScoreInput:
     queries: torch.Tensor
@@ -226,9 +233,15 @@ class NGCScoringBuffers:
         self.histories: dict[tuple[str, str], NGCQueryHistory] = {}
         self._scored_boundaries: dict[tuple[str, str], int] = {}
         self._checked_boundaries: dict[tuple[str, int], int] = {}
+        self._cadence_checks: dict[str, NGCCadenceCheck] = {}
         self._handoff: CpuGpuBuffer | None = None
         self._pending_scores: dict[tuple[str, str], NGCPendingScore] = {}
         self._score_input_layout: tuple | None = None
+        self._execution_inputs: dict[tuple[str, str], NGCScoreInput] = {}
+        self._input_order: tuple[int, ...] = ()
+        self._input_groups: dict[str, list[NGCScoreInput]] = {}
+        self._ordered_inputs: list[NGCScoreInput] = []
+        self._fused_rows: dict[tuple[str, str], int] = {}
         self._rings: dict[str, torch.Tensor] = {}
         self._windows: dict[str, int] = {}
         self._window = 0
@@ -304,6 +317,11 @@ class NGCScoringBuffers:
         self._seq_lens = {}
         self._score_inputs = None
         self._score_input_layout = None
+        self._execution_inputs.clear()
+        self._cadence_checks.clear()
+        self._input_order = ()
+        self._input_groups.clear()
+        self._ordered_inputs.clear()
         self._pending_scores.clear()
         self._fused_due_batch = None
         self._score_workspaces = {}
@@ -425,6 +443,44 @@ class NGCScoringBuffers:
                 BLOCK=256,
             )
 
+    def update_score_input(
+        self,
+        req_id: str,
+        layer_name: str,
+        req_index: int,
+        retained_tokens: int,
+        evicted_tokens: int,
+        page_size: int,
+        kernel_page_size: int,
+        page_positions: tuple[int, ...],
+        block_table: torch.Tensor,
+    ) -> NGCScoreInput:
+        """Refresh a persistent descriptor; callers must not keep snapshots."""
+        key = (req_id, layer_name)
+        item = self._execution_inputs.get(key)
+        if item is None:
+            item = NGCScoreInput(
+                req_id,
+                layer_name,
+                req_index,
+                retained_tokens,
+                evicted_tokens,
+                page_size,
+                kernel_page_size,
+                page_positions,
+                block_table,
+            )
+            self._execution_inputs[key] = item
+        else:
+            item.req_index = req_index
+            item.retained_tokens = retained_tokens
+            item.evicted_tokens = evicted_tokens
+            item.page_size = page_size
+            item.kernel_page_size = kernel_page_size
+            item.page_positions = page_positions
+            item.block_table = block_table
+        return item
+
     def prepare_score_inputs(
         self,
         inputs: Sequence[NGCScoreInput],
@@ -439,15 +495,22 @@ class NGCScoringBuffers:
         ``materialize_keys`` limits returned per-request views, while batched
         metadata is still prepared for every input required by decode.
         """
-        self._prepared_groups = {}
         if not inputs:
             return {}
+        self._prepared_groups.clear()
         from vllm.v1.attention.ops.triton_ngc_inputs import prepare_ngc_score_inputs
 
-        grouped: dict[str, list[NGCScoreInput]] = {}
-        for item in inputs:
-            grouped.setdefault(item.layer_name, []).append(item)
-        ordered = [item for group in grouped.values() for item in group]
+        order = tuple(id(item) for item in inputs)
+        if order != self._input_order:
+            self._input_groups = {}
+            for item in inputs:
+                self._input_groups.setdefault(item.layer_name, []).append(item)
+            self._ordered_inputs = [
+                item for group in self._input_groups.values() for item in group
+            ]
+            self._input_order = order
+        grouped = self._input_groups
+        ordered = self._ordered_inputs
         descriptor_size = 8 * len(ordered)
         size = descriptor_size + sum(len(item.page_positions) for item in ordered)
         device = self._rings[ordered[0].layer_name].device
@@ -467,23 +530,21 @@ class NGCScoringBuffers:
         packed = self._score_inputs.np
         descriptors = packed[:descriptor_size].reshape(-1, 8)
         offset = descriptor_size
-        for i, item in enumerate(ordered):
-            seq_len = self._seq_lens[item.req_id]
-            count = min(self._windows[item.layer_name], seq_len)
-            known = len(item.page_positions)
-            descriptors[i] = (
-                seq_len,
-                self._slots[item.req_id],
-                count,
-                item.retained_tokens,
-                item.evicted_tokens,
-                known,
-                offset,
-                item.req_index,
-            )
-            if positions_changed:
+        descriptors[:, 0] = [self._seq_lens[item.req_id] for item in ordered]
+        descriptors[:, 1] = [self._slots[item.req_id] for item in ordered]
+        np.minimum(
+            descriptors[:, 0],
+            [self._windows[item.layer_name] for item in ordered],
+            out=descriptors[:, 2],
+        )
+        descriptors[:, 3] = [item.retained_tokens for item in ordered]
+        descriptors[:, 4] = [item.evicted_tokens for item in ordered]
+        if positions_changed:
+            for i, item in enumerate(ordered):
+                known = len(item.page_positions)
+                descriptors[i, 5:] = (known, offset, item.req_index)
                 packed[offset : offset + known] = item.page_positions
-            offset += known
+                offset += known
         self._score_inputs.copy_to_gpu(size if positions_changed else descriptor_size)
         self._score_input_layout = layout
 
@@ -575,6 +636,7 @@ class NGCScoringBuffers:
     def reset_fused_decode(self) -> None:
         self._fused_decode.clear()
         self.fused_inputs.clear()
+        self._fused_rows.clear()
 
     def prepare_fused_decode(
         self, inputs: Sequence[NGCScoreInput], due: dict[tuple[str, str], bool]
@@ -586,11 +648,9 @@ class NGCScoringBuffers:
             gather_queries=False,
             materialize_keys={key for key, is_due in due.items() if is_due},
         )
-        grouped: dict[str, list[NGCScoreInput]] = {}
-        for item in inputs:
-            grouped.setdefault(item.layer_name, []).append(item)
-        if not grouped:
+        if not inputs:
             return
+        grouped = self._input_groups
         max_batch = max(len(items) for items in grouped.values())
         shape = (len(grouped), 1 << (max_batch - 1).bit_length())
         device = self._rings[next(iter(grouped))].device
@@ -609,6 +669,8 @@ class NGCScoringBuffers:
             ]
         due_batch.copy_to_gpu()
         for row, (layer_name, items) in enumerate(grouped.items()):
+            for index, item in enumerate(items):
+                self._fused_rows[item.req_id, layer_name] = index
             descriptors, workspace = self._prepared_groups[layer_name]
             batch = len(items)
             self._fused_due[layer_name] = due_batch.gpu[row, :batch]
@@ -701,11 +763,12 @@ class NGCScoringBuffers:
         state = self._fused_decode.get(layer_name)
         if state is None or state.scores is None:
             return None
-        for index, item in enumerate(state.inputs):
-            if item.req_id == req_id:
-                pages = (item.retained_tokens + item.page_size - 1) // item.page_size
-                return state.scores[index, :pages]
-        return None
+        index = self._fused_rows.get((req_id, layer_name))
+        if index is None:
+            return None
+        item = state.inputs[index]
+        pages = (item.retained_tokens + item.page_size - 1) // item.page_size
+        return state.scores[index, :pages]
 
     def _copy_handoff(self, tensors: list[torch.Tensor]) -> list[torch.Tensor]:
         """Pack on-device, transfer once, and wait before exposing CPU views."""
@@ -895,18 +958,25 @@ class NGCScoringBuffers:
         seq_lens: np.ndarray,
         cadences: set[int],
     ) -> list[NGCCadenceCheck]:
-        """Check each request/cadence once without consuming capture boundaries."""
+        """Refresh borrowed per-forward checks without consuming boundaries."""
         if not cadences:
             return []
         checks = []
         for index, req_id in enumerate(req_ids):
             seq_len = int(seq_lens[index])
-            due = {}
+            check = self._cadence_checks.get(req_id)
+            if check is None:
+                check = NGCCadenceCheck(index, req_id, seq_len, {})
+                self._cadence_checks[req_id] = check
+            else:
+                check.req_index = index
+                check.seq_len = seq_len
+                check.due_boundaries.clear()
             for cadence in cadences:
                 boundary = seq_len // cadence * cadence
                 if boundary > self._checked_boundaries.get((req_id, cadence), 0):
-                    due[cadence] = boundary
-            checks.append(NGCCadenceCheck(index, req_id, seq_len, due))
+                    check.due_boundaries[cadence] = boundary
+            checks.append(check)
         return checks
 
     def mark_cadences_checked(self, check: NGCCadenceCheck) -> None:
@@ -1078,6 +1148,16 @@ class NGCScoringBuffers:
         return decision
 
     def discard_request(self, req_id: str, *, keep_cadence: bool = False) -> None:
+        self._cadence_checks.pop(req_id, None)
+        for key in [key for key in self._execution_inputs if key[0] == req_id]:
+            del self._execution_inputs[key]
+        for key in [key for key in self._fused_rows if key[0] == req_id]:
+            del self._fused_rows[key]
+            self.fused_inputs.pop(key, None)
+        # Release grouped references before a request ID or query slot is reused.
+        self._input_order = ()
+        self._input_groups.clear()
+        self._ordered_inputs.clear()
         for key in [key for key in self._pending_scores if key[0] == req_id]:
             del self._pending_scores[key]
         for key in list(self.histories):

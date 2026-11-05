@@ -691,6 +691,121 @@ def test_ngc_full_graph_capture_switches_inactive_active_inactive(monkeypatch):
     torch.testing.assert_close(buffers._rings["layer"], previous)
 
 
+@pytest.fixture
+def noop_ngc_gather(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    launches = []
+
+    class Gather:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((args, kwargs))
+
+            return launch
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.attention.ops.triton_ngc_inputs",
+        SimpleNamespace(prepare_ngc_score_inputs=Gather()),
+    )
+    return launches
+
+
+def test_persistent_score_inputs_refresh_layout_lengths_and_fused_rows(noop_ngc_gather):
+    """Reusing descriptors must still refresh every dynamic decode/scoring input."""
+    buffers = _ring_buffers(3)
+    _step(buffers, [("a", 0, 64), ("b", 0, 64)])
+    table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    a, b = [
+        buffers.update_score_input(req, "layer.0", row, 32, 32, 16, 16, (0, 48), table)
+        for row, req in enumerate(("a", "b"))
+    ]
+    due = {("a", "layer.0"): True, ("b", "layer.0"): True}
+    buffers.prepare_fused_decode([a, b], due)
+    group = buffers._input_groups["layer.0"]
+    buffers.prepare_fused_decode([a, b], due)
+    assert buffers._input_groups["layer.0"] is group
+    new_table = torch.tensor([[5, 6, 7, 8, 9], [10, 11, 12, 13, 14]], dtype=torch.int32)
+    assert (
+        buffers.update_score_input(
+            "a", "layer.0", 1, 65, 0, 16, 16, (0, 16, 48), new_table
+        )
+        is a
+    )
+    assert (
+        buffers.update_score_input(
+            "b", "layer.0", 0, 33, 32, 16, 16, (16, 48), new_table
+        )
+        is b
+    )
+    buffers._seq_lens.update(a=65, b=65)
+    buffers.prepare_fused_decode([b, a], due)
+    state = buffers._fused_decode["layer.0"]
+    descriptors = state.descriptors.reshape(-1, 8)
+    assert descriptors[:, 0].tolist() == [65, 65]
+    assert descriptors[:, 3:6].tolist() == [[33, 32, 2], [65, 0, 3]]
+    assert descriptors[:, 7].tolist() == [0, 1]
+    assert noop_ngc_gather[-1][0][3] is new_table
+    assert state.workspace.key_positions.shape[1] >= 65
+    state.score_buffer[0].fill_(7)
+    state.score_buffer[1].fill_(13)
+    buffers.publish_fused_graph_scores()
+    assert buffers.get_fused_scores("b", "layer.0").tolist() == [7] * 3
+    assert buffers.get_fused_scores("a", "layer.0").tolist() == [13] * 5
+    assert buffers.get_fused_scores("missing", "layer.0") is None
+    group = buffers._input_groups["layer.0"]
+    a.retained_tokens = 66
+    buffers._seq_lens["a"] = 66
+    buffers.prepare_fused_decode([b, a], due)
+    assert buffers._input_groups["layer.0"] is group
+    assert buffers._fused_decode["layer.0"].descriptors.reshape(-1, 8)[
+        :, 0
+    ].tolist() == [65, 66]
+
+
+def test_persistent_execution_discards_request_and_resets_allocation(noop_ngc_gather):
+    buffers = _ring_buffers(2)
+    _step(buffers, [("a", 0, 32)])
+    table = torch.ones((1, 2), dtype=torch.int32)
+    args = ("a", "layer.0", 0, 32, 0, 16, 16, (), table)
+    original = buffers.update_score_input(*args)
+    buffers.prepare_fused_decode([original], {("a", "layer.0"): True})
+    buffers.discard_request("a", keep_cadence=True)
+    assert buffers.get_fused_scores("a", "layer.0") is None
+    replacement = buffers.update_score_input(*args)
+    assert replacement is not original
+    buffers.allocate(
+        {"layer.0": (2, 1, 1)},
+        num_slots=4,
+        max_num_tokens=512,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    assert buffers.update_score_input(*args) is not replacement
+    assert not buffers._input_groups and not buffers._fused_rows
+
+
+def test_borrowed_cadence_checks_refresh_in_place_and_reuse_request_ids():
+    buffers = _ring_buffers(1)
+    first = buffers.plan_cadences(["a", "b"], np.array([8, 3]), {8})
+    a, b = first
+    due = a.due_boundaries
+    buffers.mark_cadences_checked(a)
+    reordered = buffers.plan_cadences(["b", "a"], np.array([16, 9]), {8})
+    assert reordered[0] is b and reordered[1] is a
+    assert a.req_index == 1 and a.seq_len == 9
+    assert a.due_boundaries is due and not due
+    assert b.due_boundaries == {8: 16}
+    buffers.discard_request("a", keep_cadence=True)
+    reused = buffers.plan_cadences(["a"], np.array([9]), {8})[0]
+    assert reused is not a and not reused.due_boundaries
+    assert buffers.plan_cadences(["a"], np.array([16]), {8})[0].due_boundaries == {
+        8: 16
+    }
+
+
 def test_ngc_packed_metadata_reuses_positions_and_one_due_upload(monkeypatch):
     """Unchanged layouts upload descriptors only; due masks share one transfer."""
     import sys
@@ -750,8 +865,6 @@ def test_ngc_packed_metadata_reuses_positions_and_one_due_upload(monkeypatch):
 @pytest.mark.parametrize("kernel_page_size", [8, 16])
 def test_ngc_packed_score_inputs_match_individual_gathers(kernel_page_size):
     """Packed gathers preserve per-layer windows and original retained positions."""
-    from vllm.v1.worker.ngc_scoring import NGCScoreInput
-
     buffers = NGCScoringBuffers()
     layers = {"short": (3, 2, 7), "long": (5, 1, 300)}
     buffers.allocate(
@@ -785,7 +898,9 @@ def test_ngc_packed_score_inputs_match_individual_gathers(kernel_page_size):
     if ratio == 1:
         table = table[:, ::2].contiguous()
     inputs = [
-        NGCScoreInput(req, name, row, kept, evicted, 16, kernel_page_size, known, table)
+        buffers.update_score_input(
+            req, name, row, kept, evicted, 16, kernel_page_size, known, table
+        )
         for name in ("long", "short")
         for req, row, kept, evicted, known in (
             ("b", 1, 17, 11, (16,)),
@@ -877,6 +992,31 @@ def test_ngc_packed_score_inputs_match_individual_gathers(kernel_page_size):
         query, positions = expected_queries[key]
         torch.testing.assert_close(item.queries, query)
         torch.testing.assert_close(item.query_positions, positions)
+
+    # Cached identities survive a compacted layout and replacement table.
+    replacement = table.clone()
+    replacement[1, :ratio] += 2 * ratio
+    for item in inputs:
+        if item.layer_name != "long":
+            continue
+        is_b = item.req_id == "b"
+        assert (
+            buffers.update_score_input(
+                item.req_id,
+                item.layer_name,
+                item.req_index,
+                16 if is_b else item.retained_tokens,
+                12 if is_b else item.evicted_tokens,
+                16,
+                kernel_page_size,
+                (0,) if is_b else item.page_positions,
+                replacement,
+            )
+            is item
+        )
+    refreshed = buffers.prepare_score_inputs(inputs)["b", "long"]
+    torch.testing.assert_close(refreshed.key_positions, torch.arange(16, device="cuda"))
+    assert refreshed.block_ids.tolist() == [int(replacement[1, 0]) // ratio]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
@@ -1528,6 +1668,7 @@ def test_ngc_reserved_score_buffer_is_not_published_before_computation():
         score_buffer=reserved,
         scores=None,
     )
+    buffers._fused_rows["a", "layer"] = 0
     assert buffers.get_fused_scores("a", "layer") is None
     assert not buffers.fused_graph_ready()
     # A successful replay publishes its persistent output without a Python kernel call.

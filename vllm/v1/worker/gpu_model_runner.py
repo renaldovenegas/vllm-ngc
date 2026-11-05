@@ -215,8 +215,8 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ngc_cudagraph import NGCBoundaryGraph
 from vllm.v1.worker.ngc_scoring import (
     NGCCadenceCheck,
+    NGCLayerPlan,
     NGCPreparedScoreInput,
-    NGCScoreInput,
     NGCScoringBuffers,
     share_ngc_retained_lengths,
 )
@@ -488,6 +488,8 @@ class GPUModelRunner(
         self.ngc_scoring_buffers = NGCScoringBuffers()
         self._ngc_boundary_graph = NGCBoundaryGraph()
         self._ngc_scoring_layers: list[tuple[int, Attention]] = []
+        self._ngc_layer_plans: dict[int, NGCLayerPlan] = {}
+        self._ngc_cadences: set[int] = set()
         self._ngc_columns_checked = False
         # Last compacted layout per request and NGC group; absent means none.
         self._ngc_layouts: dict[str, dict[int, NGCCacheUpdate]] = {}
@@ -7320,18 +7322,34 @@ class GPUModelRunner(
             [layer.kv_cache for _, layer in self._ngc_scoring_layers],
         )
 
+    def _ngc_layer_plan(self, group_id: int, layer: Attention) -> NGCLayerPlan:
+        plan = self._ngc_layer_plans.get(group_id)
+        if plan is None:
+            attn_group = self.attn_groups[group_id][0]
+            table = self.input_batch.block_table[group_id]
+            impl = cast("TritonAttentionImpl", layer.impl)
+            plan = NGCLayerPlan(
+                page_size=self.kv_cache_config.kv_cache_groups[
+                    group_id
+                ].kv_cache_spec.block_size,
+                kernel_page_size=attn_group.kernel_block_size or table.block_size,
+                fused_compatible=(
+                    impl.alibi_slopes is None
+                    and impl.sinks is None
+                    and impl.logits_soft_cap == 0
+                    and impl.sliding_window == (-1, -1)
+                ),
+            )
+            self._ngc_layer_plans[group_id] = plan
+        return plan
+
     def _plan_ngc_cadences(self, num_reqs: int) -> list[NGCCadenceCheck]:
         if not self._ngc_scoring_layers:
             return []
-        cadences = {
-            policy.cadence
-            for _, layer in self._ngc_scoring_layers
-            if (policy := layer.ngc_eviction_config) is not None
-        }
         return self.ngc_scoring_buffers.plan_cadences(
             self.input_batch.req_ids[:num_reqs],
             self.optimistic_seq_lens_cpu.numpy(),
-            cadences,
+            self._ngc_cadences,
         )
 
     def _prepare_ngc_fused_decode(
@@ -7353,13 +7371,8 @@ class GPUModelRunner(
             assert policy is not None
             if policy.cadence not in pending_cadences:
                 continue
-            impl = cast("TritonAttentionImpl", layer.impl)
-            if (
-                impl.alibi_slopes is not None
-                or impl.sinks is not None
-                or impl.logits_soft_cap != 0
-                or impl.sliding_window != (-1, -1)
-            ):
+            plan = self._ngc_layer_plan(group_id, layer)
+            if not plan.fused_compatible:
                 continue
             requests = []
             for check in checks:
@@ -7379,22 +7392,18 @@ class GPUModelRunner(
             block_table = attn_group.map_to_kernel_block_table(
                 table.get_device_tensor(num_reqs)
             )
-            kernel_page_size = attn_group.kernel_block_size or table.block_size
-            block_size = self.kv_cache_config.kv_cache_groups[
-                group_id
-            ].kv_cache_spec.block_size
             for index, req_id, seq_len, _ in requests:
                 update = self._ngc_layouts.get(req_id, {}).get(group_id)
                 evicted = update.evicted_tokens if update else 0
                 inputs.append(
-                    NGCScoreInput(
+                    buffers.update_score_input(
                         req_id,
                         layer.layer_name,
                         index,
                         seq_len - evicted,
                         evicted,
-                        block_size,
-                        kernel_page_size,
+                        plan.page_size,
+                        plan.kernel_page_size,
                         update.page_positions if update else (),
                         block_table,
                     )
@@ -7409,6 +7418,7 @@ class GPUModelRunner(
         pending = []
         score_inputs = []
         score_tables = {}
+        prepared = dict(buffers.fused_inputs)
         for check in checks:
             if not check.due_boundaries:
                 continue
@@ -7427,44 +7437,34 @@ class GPUModelRunner(
                     is None
                 ):
                     continue
+                plan = self._ngc_layer_plan(group_id, layer)
+                pending.append(
+                    (req_index, req_id, group_id, layer, seq_len, plan.page_size)
+                )
+                if (req_id, layer.layer_name) in prepared:
+                    continue
                 table = self.input_batch.block_table[group_id]
-                block_size = self.kv_cache_config.kv_cache_groups[
-                    group_id
-                ].kv_cache_spec.block_size
                 update = layouts.get(group_id)
                 evicted = update.evicted_tokens if update else 0
                 attn_group = self.attn_groups[group_id][0]
-                kernel_page_size = attn_group.kernel_block_size or table.block_size
                 if group_id not in score_tables:
                     score_tables[group_id] = attn_group.map_to_kernel_block_table(
                         table.get_device_tensor(num_reqs)
                     )
                 score_inputs.append(
-                    NGCScoreInput(
+                    buffers.update_score_input(
                         req_id=req_id,
                         layer_name=layer.layer_name,
                         req_index=req_index,
                         retained_tokens=seq_len - evicted,
                         evicted_tokens=evicted,
-                        page_size=block_size,
-                        kernel_page_size=kernel_page_size,
+                        page_size=plan.page_size,
+                        kernel_page_size=plan.kernel_page_size,
                         page_positions=update.page_positions if update else (),
                         block_table=score_tables[group_id],
                     )
                 )
-                pending.append(
-                    (req_index, req_id, group_id, layer, seq_len, block_size)
-                )
-        prepared = dict(buffers.fused_inputs)
-        prepared.update(
-            buffers.prepare_score_inputs(
-                [
-                    item
-                    for item in score_inputs
-                    if (item.req_id, item.layer_name) not in prepared
-                ]
-            )
-        )
+        prepared.update(buffers.prepare_score_inputs(score_inputs))
         for req_index, req_id, group_id, layer, seq_len, block_size in pending:
             self._score_ngc_layer(
                 req_index,
@@ -7488,17 +7488,20 @@ class GPUModelRunner(
     ) -> None:
         policy = layer.ngc_eviction_config
         assert policy is not None
-        table = self.input_batch.block_table[group_id]
-        attn_group = self.attn_groups[group_id][0]
-        kernel_size = attn_group.kernel_block_size or table.block_size
-        retained_len = prepared.key_positions.numel()
-        key_cache = layer.kv_cache[..., : layer.head_size]
-        if key_cache.ndim != 4 or key_cache.shape[2] != kernel_size:
-            raise ValueError("NGC scoring requires the logical paged K/V layout")
-        num_kernel_pages = cdiv(retained_len, kernel_size)
-        kernel_table = attn_group.map_to_kernel_block_table(
-            table.get_device_tensor(req_index + 1)
-        )[req_index, :num_kernel_pages]
+        scores = self.ngc_scoring_buffers.get_fused_scores(req_id, layer.layer_name)
+        key_cache = layer.kv_cache
+        kernel_table = prepared.block_ids
+        if scores is None:
+            table = self.input_batch.block_table[group_id]
+            attn_group = self.attn_groups[group_id][0]
+            kernel_size = self._ngc_layer_plans[group_id].kernel_page_size
+            key_cache = layer.kv_cache[..., : layer.head_size]
+            if key_cache.ndim != 4 or key_cache.shape[2] != kernel_size:
+                raise ValueError("NGC scoring requires the logical paged K/V layout")
+            num_kernel_pages = cdiv(prepared.key_positions.numel(), kernel_size)
+            kernel_table = attn_group.map_to_kernel_block_table(
+                table.get_device_tensor(req_index + 1)
+            )[req_index, :num_kernel_pages]
         self.ngc_scoring_buffers.score_if_due(
             req_id,
             layer.layer_name,
@@ -7519,9 +7522,7 @@ class GPUModelRunner(
                 if (req_id, layer.layer_name) in self.ngc_scoring_buffers.fused_inputs
                 else prepared
             ),
-            precomputed_scores=self.ngc_scoring_buffers.get_fused_scores(
-                req_id, layer.layer_name
-            ),
+            precomputed_scores=scores,
             defer_selection=True,
         )
 
@@ -7568,6 +7569,8 @@ class GPUModelRunner(
             layer.ngc_query_capture = None
             layer.ngc_fused_decode = None
         self._ngc_scoring_layers = []
+        self._ngc_layer_plans.clear()
+        self._ngc_cadences.clear()
         self._ngc_columns_checked = False
         self.ngc_scoring_buffers = NGCScoringBuffers()
         self._ngc_boundary_graph = NGCBoundaryGraph()
@@ -7636,6 +7639,8 @@ class GPUModelRunner(
             ):
                 raise ValueError("NGC eviction requires unrestricted causal attention")
             self._ngc_scoring_layers.append((group_id, layer))
+            assert layer.ngc_eviction_config is not None
+            self._ngc_cadences.add(layer.ngc_eviction_config.cadence)
         if self._ngc_scoring_layers:
             self._ngc_columns = {
                 group_id: column
