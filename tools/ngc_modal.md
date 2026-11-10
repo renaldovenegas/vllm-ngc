@@ -549,3 +549,137 @@ DECODE_PROFILE_BEFORE_DIR="$PWD/.ngc-modal-results/worktrees/ngc-persistent-base
 This submits ten timing windows on one GPU. The local launcher exits after
 submission; results persist in the Modal volume. Equal-rate before/after token
 hashes must match. Upstream is the pinned v0.32.0 release, not upstream HEAD.
+
+## Model speed suite: Qwen2.5 1.5B
+
+`tools/ngc_speed_suite_modal.py` defaults to two model/batch jobs, queued to run
+one at a time on a single H100. Each
+job runs the five policies sequentially on the same GPU allocation: pristine
+pinned upstream v0.32.0 with `TRITON_ATTN`, then NGC rates 0, 0.25, 0.5 and 0.75.
+Order reverses on alternating repetitions. Every case uses a fresh process and a
+complete matching generation warmup before the measured generation.
+
+Fixed settings: BF16, cadence 256, query window 5, minimum retention 32 tokens,
+2,048 prompt tokens, exactly 6,144 generated tokens per request, greedy sampling,
+EOS ignored, prefix caching disabled, synchronous scheduling, and CUDA graphs
+enabled. The prompt is a repeated fantasy-story instruction trimmed to exactly
+2,048 token IDs; this is a speed workload, not a quality evaluation.
+
+The default model is only `Qwen/Qwen2.5-1.5B-Instruct`, using H100/TP1 for both
+batch 1 and batch 48. There is one measured repetition per policy/batch, with a
+full warmup retained. No 72B job is submitted unless explicitly selected with
+`--models 72b` (that optional path still defaults to two B200s/TP2).
+
+Run the default suite (10 measured cases plus 10 warmups):
+
+```bash
+.venv/bin/modal run --detach tools/ngc_speed_suite_modal.py
+```
+
+Run a smaller subset first:
+
+```bash
+.venv/bin/modal run --detach tools/ngc_speed_suite_modal.py \
+  --models 1.5b --batches 1 --repeats 1
+```
+
+Hardware can be selected before module import. Keep GPU count equal to TP:
+
+```bash
+NGC_SPEED_SMALL_GPU=H100 NGC_SPEED_LARGE_GPU=H100:4 \
+  .venv/bin/modal run --detach tools/ngc_speed_suite_modal.py \
+  --models 72b --large-tp 4
+```
+
+The launcher prints function-call IDs and writes
+`.ngc-modal-results/speed-suite-launch-<id>.json`. It exits after spawning; the
+GPU jobs continue detached. Every model/batch job checkpoints its `summary.json`
+and per-case `metrics.json`/`output.log` to the shared Modal volume:
+
+```bash
+.venv/bin/modal volume get vllm-ngc-test-cache \
+  results/<run_id> .ngc-modal-results/<run_id>
+```
+
+The summary includes exact model revision, source hashes, GPU identity/topology,
+command, software versions, per-rank NGC activation and graph counters, and:
+
+- TTFT and complete per-request latency distributions (mean/p50/p95/p99).
+- Batch prefill span and wall time of steps containing prompt work. Mixed
+  prefill/decode steps are labeled; these are not isolated GPU prefill times.
+- Warmed decode wall time and tokens/s, excluding prompt steps and the first
+  16 emitted tokens of every request. Full-batch decode ms/step is separate from
+  decode throughput over the potentially shrinking batch.
+- End-to-end aggregate output tokens/s and batch completion time.
+- Pooled inter-token latency and per-request mean inter-token latency. First
+  tokens are excluded from ITL; observations are at synchronous engine returns.
+- Per-rank peak PyTorch allocated/reserved GPU memory and device-used snapshots.
+  Allocator peaks are not total-device peaks; sums of rank peaks need not be
+  simultaneous. Memory RPCs occur outside the timed generation.
+- KV occupancy sampled after each scheduler allocation, retained-layout samples,
+  preemption counts and recomputed scheduled-token counts. Preempted runs are
+  marked invalid for a fixed-batch comparison rather than hidden.
+
+Timing includes engine scheduler/worker work. Full latency includes metric
+observation overhead; warmed decode sums `engine.step` wall time and excludes
+post-step observations. No per-token device synchronization is added. Eviction
+also operates during prefill, so always inspect actual retained lengths.
+
+## Component kernel benchmark suite
+
+`tools/ngc_kernel_suite_modal.py` is independent of model loading. It runs
+`benchmarks/kernels/benchmark_ngc_suite.py` on one H100 by default:
+
+```bash
+.venv/bin/modal run --detach tools/ngc_kernel_suite_modal.py
+```
+
+Defaults cover batches 1/48, retained contexts 128/512/2048/8192, uniform and
+uneven lengths (including partial pages), gapped original positions, and all,
+half, or no requests due. The only default shape is `12:2:128`: Q-head,
+KV-head, dimension for Qwen2.5-1.5B TP1. There is one outer timing trial; the
+30 inner timing iterations, compilation warmup and calibration remain for
+kernel timing. This is a single-rank benchmark, not a TP communication benchmark.
+
+For each shape, it checks correctness before timing and measures:
+
+- Standard decode, standalone scoring, their combined invocation, and fused
+  decode/scoring on identical inputs and masks.
+- Segment-count sweeps (1/4/16) for both decode paths and fused tile sizes 16/64.
+  Results include raw trials and selected configurations; these are coarse
+  sweeps, not claims of globally optimal tuning.
+- Individual standard/fused stages, including reductions; register/spill/shared
+  memory metadata when exposed by the compiler. Stage timings are diagnostics,
+  not substitutes for the combined invocation.
+- GPU score-input preparation and separate CPU+transfer wall timings for changed
+  versus unchanged layouts; active and masked-inactive query-capture kernels.
+- Prepacked stable victim ranking at rates 0/0.25/0.5/0.75. CPU grouping and the
+  scheduler handoff are excluded from this selection-kernel measurement.
+
+The main device timings use FlashInfer CUPTI, CUDA graphs and cold-L2 timing,
+with allocation, compilation and calibration excluded. Estimated effective KV
+bandwidth uses a minimum-byte model and is explicitly not actual DRAM traffic.
+Correctness includes FP32 decode/scoring references and exact metadata/capture
+checks. Non-due standalone scoring has no GPU work and is not timed as a kernel.
+
+A smaller kernel run:
+
+```bash
+NGC_KERNEL_GPU=H100 .venv/bin/modal run --detach tools/ngc_kernel_suite_modal.py \
+  --batches 1 --contexts 512 --shapes 12:2:128 --due all --lengths uniform \
+  --segments 1,16 --tiles 16 --trials 2
+```
+
+Optional actual DRAM traffic/utilization counters require Nsight Compute:
+
+```bash
+DECODE_PROFILE_NCU=1 .venv/bin/modal run --detach tools/ngc_kernel_suite_modal.py \
+  --counters --batches 1 --contexts 2048 --due all --lengths uniform
+```
+
+The counter pass is a separate process using winning configurations from the
+uninstrumented timing report. It does not invoke CUPTI timing while Nsight is
+attached. Counter permission/support failures are recorded explicitly in metadata;
+inspect `counters.csv` and `counter-output.log`. They do not invalidate separately
+collected timing data. Results and logs use the same volume download command as
+the model suite, under `ngc-kernel-suite-<id>`.
