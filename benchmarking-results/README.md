@@ -1,6 +1,6 @@
 # Latest model speed benchmarks
 
-Measured on November 10, 2026. This folder contains only the latest batch 1 and batch 48 model speed runs.
+Measured on November 10, 2026. This folder contains the latest batch 1 and batch 48 model speed runs, plus the associated kernel microbenchmark run.
 
 ## Configuration
 
@@ -9,7 +9,7 @@ Qwen/Qwen2.5-1.5B-Instruct, one H100, BF16, TRITON_ATTN, CUDA graphs enabled, te
 ## Results
 
 | Batch size | Policy | Aggregate decode tokens/s ↑ | Total generation time (s) ↓ | Decode TPS vs upstream |
-|---:|---|---:|---:|---:|
+| ---: | --- | ---: | ---: | ---: |
 | 1 | Upstream | 282.0 | 21.84 | +0.0% |
 | 1 | NGC 0% | 213.1 | 29.01 | -24.4% |
 | 1 | NGC 25% | 241.0 | 25.70 | -14.6% |
@@ -30,4 +30,4 @@ At batch 1, upstream remains fastest. At batch 48, NGC 75% improves decode throu
 - [Batch 1](ngc-speed-suite-c97f0ef533d7/summary.json)
 - [Batch 48](ngc-speed-suite-1a77d417ab9e/summary.json)
 
-The summaries retain per-case configuration, commands, metrics, memory measurements, retained-cache samples, and output hashes. This folder does not include the separate kernel benchmark or older runs.
+The summaries retain per-case configuration, commands, metrics, memory measurements, retained-cache samples, and output hashes. See [kernel microbenchmarks](kernel-microbenchmarks.md) for the separate kernel timing table and raw summary. Older runs are not included.
