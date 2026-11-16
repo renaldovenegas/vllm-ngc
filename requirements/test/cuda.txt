@@ -807,7 +807,7 @@ perceptron==0.1.4
     # via -r requirements/test/cuda.in
 perf-analyzer==0.1.0
     # via genai-perf
-pillow==12.3.0
+pillow==13.0.0
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/../common.txt
